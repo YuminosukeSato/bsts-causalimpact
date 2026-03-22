@@ -9,4 +9,5 @@ dist/
 build/
 .ruff_cache/
 z-ai/
+.claude/
 *.DS_Store
