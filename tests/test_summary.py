@@ -61,25 +61,47 @@ class TestSummaryFormat:
         assert "Relative effect (s.d.)   20.00% (2.00%) 20.00% (2.00%)" in lines
         assert "95% CI                   [10.00%, 40.00%] [10.00%, 40.00%]" in lines
 
+    def test_summary_uses_alpha_to_render_correct_ci_label_when_alpha_is_not_default(
+        self,
+    ):
+        result = _make_results(effect=2.0, p_value=0.01)
+
+        text = SummaryFormatter.summary(result, alpha=0.10, digits=2)
+
+        assert "90% CI                   [9.00, 11.00]  [90.00, 110.00]" in text
+        assert "90% CI                   [1.00, 3.00]   [15.00, 25.00]" in text
+        assert "90% CI                   [10.00%, 40.00%] [10.00%, 40.00%]" in text
+        assert "95% CI" not in text
+
     def test_summary_report_format(self):
         result = _make_results(effect=2.0, p_value=0.01)
-        text = SummaryFormatter.report(result)
+        text = SummaryFormatter.report(result, alpha=0.05)
         assert len(text) > 100
         assert "effect" in text.lower() or "impact" in text.lower()
 
+    def test_report_uses_alpha_to_render_correct_ci_label_when_alpha_is_not_default(
+        self,
+    ):
+        result = _make_results(effect=2.0, p_value=0.01)
+
+        text = SummaryFormatter.report(result, alpha=0.10)
+
+        assert "(90% CI [1.00, 3.00])" in text
+        assert "(95% CI" not in text
+
     def test_summary_digits_0(self):
         result = _make_results(effect=2.345, p_value=0.01)
-        text = SummaryFormatter.summary(result, digits=0)
+        text = SummaryFormatter.summary(result, alpha=0.05, digits=0)
         assert "2.345" not in text
 
     def test_summary_digits_10(self):
         result = _make_results(effect=2.0, p_value=0.01)
-        text = SummaryFormatter.summary(result, digits=10)
+        text = SummaryFormatter.summary(result, alpha=0.05, digits=10)
         assert isinstance(text, str)
 
     def test_summary_shows_cumulative_ci_in_effect_row(self):
         result = _make_results(effect=2.0, p_value=0.01)
-        text = SummaryFormatter.summary(result, digits=2)
+        text = SummaryFormatter.summary(result, alpha=0.05, digits=2)
         ci_line = text.split("\n")[8]
         assert "15.00" in ci_line
         assert "25.00" in ci_line
@@ -88,10 +110,10 @@ class TestSummaryFormat:
 class TestReportContent:
     def test_report_significant_effect(self):
         result = _make_results(effect=3.0, p_value=0.001)
-        text = SummaryFormatter.report(result)
+        text = SummaryFormatter.report(result, alpha=0.05)
         assert "significant" in text.lower()
 
     def test_report_no_effect(self):
         result = _make_results(effect=0.1, p_value=0.45)
-        text = SummaryFormatter.report(result)
+        text = SummaryFormatter.report(result, alpha=0.05)
         assert "not" in text.lower() or "no" in text.lower()

@@ -26,6 +26,7 @@ DEFAULT_MODEL_ARGS = {
     "prior_level_sd": 0.01,
     "expected_model_size": 2,
     "dynamic_regression": False,
+    "state_model": "local_level",
     "nseasons": None,
     "season_duration": None,
 }
@@ -45,7 +46,15 @@ def _normalize_model_args(
             raise ValueError(msg)
         args["season_duration"] = args.pop("season.duration")
 
-    return {**DEFAULT_MODEL_ARGS, **args}
+    normalized = {**DEFAULT_MODEL_ARGS, **args}
+    if normalized["state_model"] not in {"local_level", "local_linear_trend"}:
+        msg = (
+            "state_model must be one of "
+            "{'local_level', 'local_linear_trend'}, "
+            f"got {normalized['state_model']}"
+        )
+        raise ValueError(msg)
+    return normalized
 
 
 class CausalImpact:
@@ -102,6 +111,7 @@ class CausalImpact:
             nseasons=args["nseasons"],
             season_duration=args["season_duration"],
             dynamic_regression=bool(args.get("dynamic_regression", False)),
+            state_model=str(args["state_model"]),
         )
 
     def _compute_results(self, prepared: PreparedData, samples) -> CausalImpactResults:
@@ -122,11 +132,11 @@ class CausalImpact:
 
     def summary(self, output: str = "summary", digits: int = 2) -> str:
         if output == "report":
-            return SummaryFormatter.report(self._results)
-        return SummaryFormatter.summary(self._results, digits=digits)
+            return SummaryFormatter.report(self._results, alpha=self._alpha)
+        return SummaryFormatter.summary(self._results, alpha=self._alpha, digits=digits)
 
     def report(self) -> str:
-        return SummaryFormatter.report(self._results)
+        return SummaryFormatter.report(self._results, alpha=self._alpha)
 
     def plot(self, metrics: list[str] | None = None) -> Figure:
         if isinstance(self._data, pd.DataFrame):
@@ -151,15 +161,17 @@ class CausalImpact:
 
         return pd.DataFrame(
             {
+                "actual": self._results.actual,
+                "predicted_mean": self._results.predictions_mean,
+                "predicted_lower": self._results.predictions_lower,
+                "predicted_upper": self._results.predictions_upper,
+                "predictions_sd": self._results.predictions_sd,
                 "point_effect": self._results.point_effects,
                 "point_effect_lower": self._results.point_effect_lower,
                 "point_effect_upper": self._results.point_effect_upper,
                 "cumulative_effect": self._results.cumulative_effect,
                 "cumulative_effect_lower": self._results.cumulative_effect_lower,
                 "cumulative_effect_upper": self._results.cumulative_effect_upper,
-                "predicted_mean": self._results.predictions_mean,
-                "predicted_lower": self._results.predictions_lower,
-                "predicted_upper": self._results.predictions_upper,
             },
             index=post_index,
         )

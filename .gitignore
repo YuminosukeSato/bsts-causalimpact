@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.so
+*.dSYM/
 *.egg-info/
 dist/
 build/

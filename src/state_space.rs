@@ -9,6 +9,24 @@
 //! same public API shape as R's `nseasons` / `season.duration`.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateModel {
+    LocalLevel,
+    LocalLinearTrend,
+}
+
+impl StateModel {
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name {
+            "local_level" => Ok(Self::LocalLevel),
+            "local_linear_trend" => Ok(Self::LocalLinearTrend),
+            _ => Err(format!(
+                "state_model must be one of {{'local_level', 'local_linear_trend'}}, got {name}"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeasonalConfig {
     nseasons: usize,
     season_duration: usize,

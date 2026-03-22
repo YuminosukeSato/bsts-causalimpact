@@ -11,7 +11,8 @@ No TensorFlow required. 10-30x faster than R.
 pip install bsts-causalimpact
 ```
 
-Requires Python 3.10+ and a Rust toolchain (only for building from source).
+Requires Python 3.10+.
+Rust is only needed when building from source instead of installing a wheel.
 
 ## Example: Measuring the Effect of an Intervention
 
@@ -168,6 +169,8 @@ print(ci.posterior_inclusion_probs)
 | `prior_level_sd` | 0.01 | Prior standard deviation for the local level |
 | `standardize_data` | `True` | Standardize data before fitting |
 | `expected_model_size` | 2 | Expected number of active covariates (spike-and-slab prior) |
+| `dynamic_regression` | `False` | Enable time-varying regression coefficients |
+| `state_model` | `"local_level"` | `"local_level"` or `"local_linear_trend"` |
 | `nseasons` | `None` | Seasonal cycle count |
 | `season_duration` | `None` | Duration of each seasonal block (defaults to 1 when `nseasons` is set) |
 

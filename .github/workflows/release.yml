@@ -54,8 +54,63 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  smoke-test-wheels:
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: macos-14
+            target: aarch64
+          - os: macos-latest
+            target: x86_64
+          - os: windows-latest
+            target: x64
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+      - name: Install built wheel
+        shell: python
+        run: |
+          import glob
+          import subprocess
+          import sys
+
+          wheels = glob.glob("dist/*.whl")
+          assert wheels, "No wheel artifact downloaded"
+          subprocess.check_call([sys.executable, "-m", "pip", "install", wheels[0]])
+      - name: Smoke test wheel
+        shell: python
+        run: |
+          import numpy as np
+          import pandas as pd
+          from causal_impact import CausalImpact, ModelOptions
+
+          dates = pd.date_range("2020-01-01", periods=24, freq="D")
+          x = np.linspace(0.0, 1.0, 24)
+          y = 5.0 + 0.2 * np.arange(24) + 1.5 * x
+          y[18:] += 2.0
+          data = pd.DataFrame({"y": y, "x1": x}, index=dates)
+
+          ci = CausalImpact(
+              data,
+              ["2020-01-01", "2020-01-18"],
+              ["2020-01-19", "2020-01-24"],
+              model_args=ModelOptions(niter=100, nwarmup=50, seed=42),
+          )
+          assert ci.summary()
+          assert len(ci.inferences.columns) >= 11
+
   publish:
-    needs: [build-wheels, build-sdist]
+    needs: [build-sdist, smoke-test-wheels]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

@@ -9,8 +9,13 @@ class SummaryFormatter:
     """Format CausalImpact results as text summary or report."""
 
     @staticmethod
-    def summary(results: CausalImpactResults, digits: int = 2) -> str:
+    def summary(
+        results: CausalImpactResults,
+        alpha: float = 0.05,
+        digits: int = 2,
+    ) -> str:
         fmt = f".{digits}f"
+        ci_label = SummaryFormatter._ci_label(alpha)
 
         avg_actual = format(results.actual.mean(), fmt)
         cum_actual = format(results.actual.sum(), fmt)
@@ -62,7 +67,8 @@ class SummaryFormatter:
         )
         rel_row = f"Relative effect (s.d.)   {rel_m}% ({rel_sd}%) {rel_m}% ({rel_sd}%)"
         rel_ci_row = (
-            f"95% CI                   [{rel_lo}%, {rel_hi}%] [{rel_lo}%, {rel_hi}%]"
+            f"{ci_label}                   "
+            f"[{rel_lo}%, {rel_hi}%] [{rel_lo}%, {rel_hi}%]"
         )
 
         lines = [
@@ -71,10 +77,10 @@ class SummaryFormatter:
             "                         Average        Cumulative",
             f"Actual                   {avg_actual}          {cum_actual}",
             pred_row,
-            f"95% CI                   {avg_pred_ci}  {cum_pred_ci}",
+            f"{ci_label}                   {avg_pred_ci}  {cum_pred_ci}",
             "",
             eff_row,
-            f"95% CI                   {avg_eff_ci}   {cum_eff_ci}",
+            f"{ci_label}                   {avg_eff_ci}   {cum_eff_ci}",
             "",
             rel_row,
             rel_ci_row,
@@ -86,9 +92,10 @@ class SummaryFormatter:
         return "\n".join(lines)
 
     @staticmethod
-    def report(results: CausalImpactResults) -> str:
+    def report(results: CausalImpactResults, alpha: float = 0.05) -> str:
         is_significant = results.p_value < 0.05
         direction = "increase" if results.point_effect_mean >= 0 else "decrease"
+        ci_label = SummaryFormatter._ci_label(alpha)
 
         lines = [
             "Analysis report {CausalImpact}",
@@ -98,7 +105,7 @@ class SummaryFormatter:
             f"the intervention.",
             "",
             f"The average causal effect was {results.point_effect_mean:.2f} "
-            f"(95% CI [{results.ci_lower:.2f}, {results.ci_upper:.2f}]).",
+            f"({ci_label} [{results.ci_lower:.2f}, {results.ci_upper:.2f}]).",
             "",
             f"The cumulative effect over the entire post-period was "
             f"{results.cumulative_effect_total:.2f}.",
@@ -127,3 +134,10 @@ class SummaryFormatter:
             )
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _ci_label(alpha: float) -> str:
+        ci_level = (1.0 - alpha) * 100.0
+        if ci_level.is_integer():
+            return f"{int(ci_level)}% CI"
+        return f"{ci_level:.1f}% CI"

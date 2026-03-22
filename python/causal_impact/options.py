@@ -18,8 +18,9 @@ class ModelOptions:
     seed: int = 0
     standardize_data: bool = True
     prior_level_sd: float = 0.01
-    expected_model_size: int = 1
+    expected_model_size: int = 2
     dynamic_regression: bool = False
+    state_model: str = "local_level"
     nseasons: int | None = None
     season_duration: int | None = None
 
@@ -43,6 +44,13 @@ class ModelOptions:
             msg = (
                 "dynamic_regression must be a bool, "
                 f"got {type(self.dynamic_regression).__name__}"
+            )
+            raise ValueError(msg)
+        if self.state_model not in {"local_level", "local_linear_trend"}:
+            msg = (
+                "state_model must be one of "
+                "{'local_level', 'local_linear_trend'}, "
+                f"got {self.state_model}"
             )
             raise ValueError(msg)
         if self.nseasons is not None:

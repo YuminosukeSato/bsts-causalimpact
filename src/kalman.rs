@@ -1,5 +1,6 @@
 //! Kalman filter and Durbin-Koopman simulation smoother for Local Level model,
-//! plus multivariate FFBS for dynamic regression coefficients β_t.
+//! plus multivariate FFBS for dynamic regression coefficients β_t and a
+//! local linear trend state model.
 //!
 //! The simulation smoother draws states from p(α | y, σ²_obs, σ²_level, β)
 //! using the method of Durbin & Koopman (2002).
@@ -87,6 +88,70 @@ pub fn simulation_smoother<R: Rng>(
         .collect()
 }
 
+pub fn local_linear_trend_smoother<R: Rng>(
+    rng: &mut R,
+    y_adj: &[f64],
+    sigma2_obs: f64,
+    sigma2_level: f64,
+    sigma2_slope: f64,
+    initial_state_mean: f64,
+    initial_state_variance: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let t = y_adj.len();
+    if t == 0 {
+        return (vec![], vec![]);
+    }
+
+    let centered_y_adj: Vec<f64> = y_adj
+        .iter()
+        .map(|value| value - initial_state_mean)
+        .collect();
+    let initial_slope_variance =
+        (initial_state_variance / (t.max(1) as f64).powi(2)).max(F_MIN);
+
+    let mut level_plus = vec![0.0; t];
+    let mut slope_plus = vec![0.0; t];
+    let mut y_plus = vec![0.0; t];
+
+    level_plus[0] = sample_normal(rng, 0.0, initial_state_variance);
+    slope_plus[0] = sample_normal(rng, 0.0, initial_slope_variance);
+    y_plus[0] = level_plus[0] + sample_normal(rng, 0.0, sigma2_obs);
+
+    for i in 1..t {
+        level_plus[i] =
+            level_plus[i - 1] + slope_plus[i - 1] + sample_normal(rng, 0.0, sigma2_level);
+        slope_plus[i] = slope_plus[i - 1] + sample_normal(rng, 0.0, sigma2_slope);
+        y_plus[i] = level_plus[i] + sample_normal(rng, 0.0, sigma2_obs);
+    }
+
+    let y_star: Vec<f64> = centered_y_adj
+        .iter()
+        .zip(&y_plus)
+        .map(|(y, yp)| y - yp)
+        .collect();
+    let (level_hat, slope_hat) = local_linear_trend_mean(
+        &y_star,
+        sigma2_obs,
+        sigma2_level,
+        sigma2_slope,
+        initial_state_variance,
+        initial_slope_variance,
+    );
+
+    let levels = level_hat
+        .iter()
+        .zip(level_plus.iter())
+        .map(|(level_hat_t, level_plus_t)| level_hat_t + level_plus_t + initial_state_mean)
+        .collect();
+    let slopes = slope_hat
+        .iter()
+        .zip(slope_plus.iter())
+        .map(|(slope_hat_t, slope_plus_t)| slope_hat_t + slope_plus_t)
+        .collect();
+
+    (levels, slopes)
+}
+
 fn state_smoother(
     a: &[f64],
     p: &[f64],
@@ -114,6 +179,177 @@ fn state_smoother(
     }
 
     alpha_hat
+}
+
+fn local_linear_trend_mean(
+    y: &[f64],
+    sigma2_obs: f64,
+    sigma2_level: f64,
+    sigma2_slope: f64,
+    initial_level_variance: f64,
+    initial_slope_variance: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let t = y.len();
+    let transition = [[1.0, 1.0], [0.0, 1.0]];
+    let transition_t = [[1.0, 0.0], [1.0, 1.0]];
+    let q = [[sigma2_level, 0.0], [0.0, sigma2_slope]];
+    let init_cov = [
+        [initial_level_variance.max(F_MIN), 0.0],
+        [0.0, initial_slope_variance.max(F_MIN)],
+    ];
+
+    let mut a_pred_store = vec![[0.0, 0.0]; t];
+    let mut p_pred_store = vec![[[0.0, 0.0], [0.0, 0.0]]; t];
+    let mut a_filt = vec![[0.0, 0.0]; t];
+    let mut p_filt = vec![[[0.0, 0.0], [0.0, 0.0]]; t];
+
+    for i in 0..t {
+        let (a_pred, p_pred) = if i == 0 {
+            ([0.0, 0.0], init_cov)
+        } else {
+            let mean = apply_transition(a_filt[i - 1], transition);
+            let covariance = predict_covariance(p_filt[i - 1], transition, transition_t, q);
+            (mean, covariance)
+        };
+        a_pred_store[i] = a_pred;
+        p_pred_store[i] = p_pred;
+
+        let innovation = y[i] - a_pred[0];
+        let innovation_variance = (p_pred[0][0] + sigma2_obs).max(F_MIN);
+        let gain = [
+            p_pred[0][0] / innovation_variance,
+            p_pred[1][0] / innovation_variance,
+        ];
+
+        a_filt[i] = [
+            a_pred[0] + gain[0] * innovation,
+            a_pred[1] + gain[1] * innovation,
+        ];
+        p_filt[i] = update_covariance(p_pred, gain, sigma2_obs);
+        symmetrize_and_floor_2x2(&mut p_filt[i]);
+    }
+
+    let mut smooth = vec![[0.0, 0.0]; t];
+    smooth[t - 1] = a_filt[t - 1];
+
+    for i in (0..t - 1).rev() {
+        let predicted_next = p_pred_store[i + 1];
+        let smoother_gain = matrix_mul_2x2(
+            p_filt[i],
+            matrix_mul_2x2(transition_t, invert_2x2(predicted_next)),
+        );
+        let diff = [
+            smooth[i + 1][0] - a_pred_store[i + 1][0],
+            smooth[i + 1][1] - a_pred_store[i + 1][1],
+        ];
+        let correction = matrix_vec_mul_2x2(smoother_gain, diff);
+        smooth[i] = [
+            a_filt[i][0] + correction[0],
+            a_filt[i][1] + correction[1],
+        ];
+    }
+
+    (
+        smooth.iter().map(|state| state[0]).collect(),
+        smooth.iter().map(|state| state[1]).collect(),
+    )
+}
+
+fn apply_transition(state: [f64; 2], transition: [[f64; 2]; 2]) -> [f64; 2] {
+    [
+        transition[0][0] * state[0] + transition[0][1] * state[1],
+        transition[1][0] * state[0] + transition[1][1] * state[1],
+    ]
+}
+
+fn predict_covariance(
+    covariance: [[f64; 2]; 2],
+    transition: [[f64; 2]; 2],
+    transition_t: [[f64; 2]; 2],
+    process_noise: [[f64; 2]; 2],
+) -> [[f64; 2]; 2] {
+    add_matrix_2x2(
+        matrix_mul_2x2(matrix_mul_2x2(transition, covariance), transition_t),
+        process_noise,
+    )
+}
+
+fn update_covariance(
+    predicted_covariance: [[f64; 2]; 2],
+    gain: [f64; 2],
+    sigma2_obs: f64,
+) -> [[f64; 2]; 2] {
+    let identity_minus_kh = [[1.0 - gain[0], 0.0], [-gain[1], 1.0]];
+    let joseph_left = matrix_mul_2x2(identity_minus_kh, predicted_covariance);
+    let joseph = matrix_mul_2x2(joseph_left, transpose_2x2(identity_minus_kh));
+    let observation_term = [
+        [gain[0] * gain[0] * sigma2_obs, gain[0] * gain[1] * sigma2_obs],
+        [gain[1] * gain[0] * sigma2_obs, gain[1] * gain[1] * sigma2_obs],
+    ];
+    add_matrix_2x2(joseph, observation_term)
+}
+
+fn matrix_mul_2x2(lhs: [[f64; 2]; 2], rhs: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+    [
+        [
+            lhs[0][0] * rhs[0][0] + lhs[0][1] * rhs[1][0],
+            lhs[0][0] * rhs[0][1] + lhs[0][1] * rhs[1][1],
+        ],
+        [
+            lhs[1][0] * rhs[0][0] + lhs[1][1] * rhs[1][0],
+            lhs[1][0] * rhs[0][1] + lhs[1][1] * rhs[1][1],
+        ],
+    ]
+}
+
+fn matrix_vec_mul_2x2(matrix: [[f64; 2]; 2], vector: [f64; 2]) -> [f64; 2] {
+    [
+        matrix[0][0] * vector[0] + matrix[0][1] * vector[1],
+        matrix[1][0] * vector[0] + matrix[1][1] * vector[1],
+    ]
+}
+
+fn add_matrix_2x2(lhs: [[f64; 2]; 2], rhs: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+    [
+        [lhs[0][0] + rhs[0][0], lhs[0][1] + rhs[0][1]],
+        [lhs[1][0] + rhs[1][0], lhs[1][1] + rhs[1][1]],
+    ]
+}
+
+fn transpose_2x2(matrix: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+    [[matrix[0][0], matrix[1][0]], [matrix[0][1], matrix[1][1]]]
+}
+
+fn invert_2x2(mut matrix: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+    let ridge = ((matrix[0][0].abs() + matrix[1][1].abs()) * 1e-10).max(1e-12);
+    matrix[0][0] += ridge;
+    matrix[1][1] += ridge;
+
+    let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
+    let safe_determinant = if determinant.abs() < F_MIN {
+        F_MIN.copysign(determinant.signum().max(1.0))
+    } else {
+        determinant
+    };
+
+    [
+        [
+            matrix[1][1] / safe_determinant,
+            -matrix[0][1] / safe_determinant,
+        ],
+        [
+            -matrix[1][0] / safe_determinant,
+            matrix[0][0] / safe_determinant,
+        ],
+    ]
+}
+
+fn symmetrize_and_floor_2x2(matrix: &mut [[f64; 2]; 2]) {
+    let off_diagonal = 0.5 * (matrix[0][1] + matrix[1][0]);
+    matrix[0][1] = off_diagonal;
+    matrix[1][0] = off_diagonal;
+    matrix[0][0] = matrix[0][0].max(F_MIN);
+    matrix[1][1] = matrix[1][1].max(F_MIN);
 }
 
 /// Multivariate FFBS (Forward Filtering Backward Sampling) for dynamic
@@ -497,5 +733,36 @@ mod tests {
                 assert!(val.is_finite(), "Non-finite value in beta_t: {}", val);
             }
         }
+    }
+
+    #[test]
+    fn test_local_linear_trend_smoother_output_lengths() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let y: Vec<f64> = (0..20).map(|i| 5.0 + 0.2 * i as f64).collect();
+
+        let (levels, slopes) =
+            local_linear_trend_smoother(&mut rng, &y, 0.1, 0.01, 0.001, 5.0, 1.0);
+
+        assert_eq!(levels.len(), y.len());
+        assert_eq!(slopes.len(), y.len());
+    }
+
+    #[test]
+    fn test_local_linear_trend_smoother_tracks_linear_signal_because_slope_state_should_not_collapse() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let y: Vec<f64> = (0..60).map(|i| 10.0 + 0.3 * i as f64).collect();
+        let n_samples = 100;
+        let mut mean_last_level = 0.0;
+        let mut mean_last_slope = 0.0;
+
+        for _ in 0..n_samples {
+            let (levels, slopes) =
+                local_linear_trend_smoother(&mut rng, &y, 0.1, 0.01, 0.001, 10.0, 1.0);
+            mean_last_level += levels[levels.len() - 1] / n_samples as f64;
+            mean_last_slope += slopes[slopes.len() - 1] / n_samples as f64;
+        }
+
+        assert!((mean_last_level - 27.7).abs() < 2.0);
+        assert!((mean_last_slope - 0.3).abs() < 0.2);
     }
 }
