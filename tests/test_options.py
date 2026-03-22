@@ -213,6 +213,7 @@ class TestToDict:
             "standardize_data",
             "prior_level_sd",
             "expected_model_size",
+            "dynamic_regression",
             "nseasons",
             "season_duration",
         }
