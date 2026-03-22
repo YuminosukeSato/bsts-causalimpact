@@ -5,42 +5,79 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: '0 2 * * 1'  # weekly Monday 02:00 UTC
+    - cron: "0 2 * * 1"
 
 jobs:
-  # Job 1: fast test with committed fixtures (no R required)
-  equivalence-fast:
+  # R live comparison: non-blocking (R install ~15min)
+  equivalence-with-r:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install dependencies
-        run: pip install uv && uv sync --all-extras
-      - name: Run numerical equivalence tests
-        run: .venv/bin/pytest tests/test_numerical_equivalence.py -v --tb=short
-
-  # Job 2: weekly fixture regeneration (R required)
-  regenerate-fixtures:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    if: github.event_name != 'schedule'
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: r-lib/actions/setup-r@v2
         with:
-          r-version: '4.4'
+          r-version: "4.4"
       - name: Install R packages
         run: |
-          Rscript -e "install.packages(c('CausalImpact','jsonlite'), repos='https://cloud.r-project.org')"
+          Rscript -e "install.packages(
+            c('CausalImpact','jsonlite'),
+            repos='https://cloud.r-project.org'
+          )"
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: pip install uv && uv sync --all-extras
+      - name: Generate fresh R fixtures
+        run: Rscript scripts/generate_r_reference.R
+      - name: Run equivalence tests
+        run: .venv/bin/pytest tests/test_numerical_equivalence.py -v --tb=short
+        env:
+          CI: "true"
+
+  # Weekly: regenerate fixtures from R and auto-commit
+  regenerate-fixtures:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "4.4"
+      - name: Install R packages
+        run: |
+          Rscript -e "install.packages(
+            c('CausalImpact','jsonlite'),
+            repos='https://cloud.r-project.org'
+          )"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install Python dependencies
         run: pip install uv && uv sync --all-extras
       - name: Regenerate R fixtures
         run: Rscript scripts/generate_r_reference.R
-      - name: Run equivalence tests with fresh fixtures
+      - name: Run equivalence tests
         run: .venv/bin/pytest tests/test_numerical_equivalence.py -v --tb=short
+        env:
+          CI: "true"
+      - name: Commit updated fixtures if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add tests/fixtures/r_reference_*.json
+          if git diff --staged --quiet; then
+            echo "No fixture changes, skipping commit"
+          else
+            git commit -m "chore: regenerate R fixtures (weekly update)"
+            git push
+          fi
