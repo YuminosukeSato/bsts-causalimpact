@@ -24,6 +24,7 @@ no_effect シナリオ（true_effect=0）:
 """
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -50,10 +51,14 @@ ABS_TOL_NO_EFFECT = 2.0  # absolute tolerance when true_effect=0
 def _load_fixture(scenario: str) -> dict:
     path = FIXTURES_DIR / f"r_reference_{scenario}.json"
     if not path.exists():
-        pytest.skip(
+        msg = (
             f"R fixture not found: {path}. "
             "Run scripts/generate_r_reference.R"
         )
+        if os.environ.get("CI") == "true":
+            pytest.fail(msg)
+        else:
+            pytest.skip(msg)
     return json.loads(path.read_text())
 
 
@@ -323,7 +328,19 @@ class TestEquivalenceBoundary:
             "tests.test_numerical_equivalence.FIXTURES_DIR",
             tmp_path,
         )
+        monkeypatch.delenv("CI", raising=False)
         with pytest.raises(pytest.skip.Exception):
+            _load_fixture("nonexistent_scenario")
+
+    def test_fixture_missing_causes_fail_in_ci(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "tests.test_numerical_equivalence.FIXTURES_DIR",
+            tmp_path,
+        )
+        monkeypatch.setenv("CI", "true")
+        with pytest.raises(pytest.fail.Exception):
             _load_fixture("nonexistent_scenario")
 
     def test_tolerance_uses_absolute_when_r_val_near_zero(self):
