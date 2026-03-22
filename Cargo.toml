@@ -10,7 +10,6 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"] }
 numpy = "0.23"
-nalgebra = "0.33"
 rand = "0.8"
+rayon = "1.10"
 rand_distr = "0.4"
-statrs = "0.18"
