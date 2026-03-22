@@ -31,7 +31,7 @@ class TestSamplerShapes:
         assert len(result.states) == 40
         assert len(result.sigma_obs) == 40
 
-    def test_sampler_keeps_post_period_states_non_constant_because_random_walk_uncertainty_must_propagate(self):
+    def test_sampler_post_period_states_non_constant(self):
         y = [10.0 + 0.2 * i for i in range(40)]
         result = run_gibbs_sampler(
             y=y, x=None, pre_end=25, niter=5, nwarmup=2, nchains=1,

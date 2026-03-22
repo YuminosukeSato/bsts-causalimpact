@@ -6,9 +6,7 @@ These tests serve as the specification for the spike-and-slab feature.
 
 import numpy as np
 import pytest
-
 from causal_impact._core import run_gibbs_sampler
-
 
 # ---------------------------------------------------------------------------
 # Fixtures: deterministic data generators
@@ -150,7 +148,8 @@ class TestSpikeSlabSelection:
         samples = _run_sampler_with_spike_slab(y, x, pre_end,
                                                 expected_model_size=0.5)
         probs = _inclusion_probs(samples)
-        assert probs[0] > 0.9, f"Strong signal inclusion prob {probs[0]} should be > 0.9"
+        msg = f"Strong signal inclusion prob {probs[0]} should be > 0.9"
+        assert probs[0] > 0.9, msg
 
     def test_spike_slab_k2_selects_signal_over_noise(self):
         """k=2: signal covariate has higher inclusion prob than noise."""
