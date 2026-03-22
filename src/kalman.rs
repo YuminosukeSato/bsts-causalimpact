@@ -12,6 +12,8 @@ pub fn kalman_filter(
     y_adj: &[f64],
     sigma2_obs: f64,
     sigma2_level: f64,
+    initial_state_mean: f64,
+    initial_state_variance: f64,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let t = y_adj.len();
     let mut a = vec![0.0; t];
@@ -19,8 +21,8 @@ pub fn kalman_filter(
     let mut v = vec![0.0; t];
     let mut f = vec![0.0; t];
 
-    let a0 = 0.0;
-    let p0 = 1e7;
+    let a0 = initial_state_mean;
+    let p0 = initial_state_variance.max(F_MIN);
 
     for i in 0..t {
         let a_prior = if i == 0 { a0 } else { a[i - 1] };
@@ -43,13 +45,19 @@ pub fn simulation_smoother<R: Rng>(
     y_adj: &[f64],
     sigma2_obs: f64,
     sigma2_level: f64,
+    initial_state_mean: f64,
+    initial_state_variance: f64,
 ) -> Vec<f64> {
     let t = y_adj.len();
+    let centered_y_adj: Vec<f64> = y_adj
+        .iter()
+        .map(|value| value - initial_state_mean)
+        .collect();
 
     let mut alpha_plus = vec![0.0; t];
     let mut y_plus = vec![0.0; t];
 
-    alpha_plus[0] = sample_normal(rng, 0.0, 1e7);
+    alpha_plus[0] = sample_normal(rng, 0.0, initial_state_variance);
     y_plus[0] = alpha_plus[0] + sample_normal(rng, 0.0, sigma2_obs);
 
     for i in 1..t {
@@ -57,28 +65,50 @@ pub fn simulation_smoother<R: Rng>(
         y_plus[i] = alpha_plus[i] + sample_normal(rng, 0.0, sigma2_obs);
     }
 
-    let y_star: Vec<f64> = y_adj.iter().zip(&y_plus).map(|(y, yp)| y - yp).collect();
-    let (a, p, v, f) = kalman_filter(&y_star, sigma2_obs, sigma2_level);
-    let alpha_hat = state_smoother(&a, &p, &v, &f, sigma2_level);
+    let y_star: Vec<f64> = centered_y_adj
+        .iter()
+        .zip(&y_plus)
+        .map(|(y, yp)| y - yp)
+        .collect();
+    let (a, p, v, f) = kalman_filter(
+        &y_star,
+        sigma2_obs,
+        sigma2_level,
+        0.0,
+        initial_state_variance,
+    );
+    let alpha_hat = state_smoother(&a, &p, &v, &f, sigma2_level, 0.0, initial_state_variance);
 
     alpha_hat
         .iter()
         .zip(alpha_plus.iter())
-        .map(|(alpha_hat_t, alpha_plus_t)| alpha_hat_t + alpha_plus_t)
+        .map(|(alpha_hat_t, alpha_plus_t)| alpha_hat_t + alpha_plus_t + initial_state_mean)
         .collect()
 }
 
-fn state_smoother(a: &[f64], p: &[f64], v: &[f64], f: &[f64], sigma2_level: f64) -> Vec<f64> {
+fn state_smoother(
+    a: &[f64],
+    p: &[f64],
+    v: &[f64],
+    f: &[f64],
+    sigma2_level: f64,
+    initial_state_mean: f64,
+    initial_state_variance: f64,
+) -> Vec<f64> {
     let t = a.len();
     let mut alpha_hat = vec![0.0; t];
     let mut r = 0.0;
 
     for i in (0..t).rev() {
-        let p_prior = if i == 0 { 1e7 } else { p[i - 1] + sigma2_level };
+        let p_prior = if i == 0 {
+            initial_state_variance
+        } else {
+            p[i - 1] + sigma2_level
+        };
         let k = p_prior / f[i];
         r = v[i] / f[i] + (1.0 - k) * r;
 
-        let a_prior = if i == 0 { 0.0 } else { a[i - 1] };
+        let a_prior = if i == 0 { initial_state_mean } else { a[i - 1] };
         alpha_hat[i] = a_prior + p_prior * r;
     }
 
@@ -94,7 +124,7 @@ mod tests {
     #[test]
     fn test_kalman_filter_constant_signal() {
         let y: Vec<f64> = vec![5.0; 50];
-        let (a, _p, _v, _f) = kalman_filter(&y, 1.0, 0.01);
+        let (a, _p, _v, _f) = kalman_filter(&y, 1.0, 0.01, 5.0, 1.0);
         assert!(
             (a[49] - 5.0).abs() < 0.1,
             "Filtered state should converge to 5.0, got {}",
@@ -105,7 +135,7 @@ mod tests {
     #[test]
     fn test_kalman_filter_output_lengths() {
         let y: Vec<f64> = vec![1.0, 2.0, 3.0];
-        let (a, p, v, f) = kalman_filter(&y, 1.0, 0.1);
+        let (a, p, v, f) = kalman_filter(&y, 1.0, 0.1, 1.0, 1.0);
         assert_eq!(a.len(), 3);
         assert_eq!(p.len(), 3);
         assert_eq!(v.len(), 3);
@@ -116,7 +146,7 @@ mod tests {
     fn test_simulation_smoother_shape() {
         let mut rng = StdRng::seed_from_u64(42);
         let y: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let states = simulation_smoother(&mut rng, &y, 1.0, 0.01);
+        let states = simulation_smoother(&mut rng, &y, 1.0, 0.01, 1.0, 1.0);
         assert_eq!(states.len(), 5);
     }
 
@@ -128,7 +158,7 @@ mod tests {
         let mut mean_states = vec![0.0; 50];
 
         for _ in 0..n_samples {
-            let states = simulation_smoother(&mut rng, &y, 0.1, 0.01);
+            let states = simulation_smoother(&mut rng, &y, 0.1, 0.01, 10.0, 1.0);
             for (mean_state, state) in mean_states.iter_mut().zip(states.iter()) {
                 *mean_state += state / n_samples as f64;
             }

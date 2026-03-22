@@ -43,9 +43,7 @@ pub fn run_sampler(
 
     let k = x.len();
     if k > 0 && expected_model_size <= 0.0 {
-        return Err(
-            "expected_model_size must be > 0 when covariates are present".to_string(),
-        );
+        return Err("expected_model_size must be > 0 when covariates are present".to_string());
     }
 
     let model = StateSpaceModel::new(y.clone(), x);
@@ -141,7 +139,14 @@ fn run_single_chain(
     for iter in 0..(niter + nwarmup) {
         // Step 1: State sampling (simulation smoother)
         let y_adj = adjusted_observations(y, model, &beta, pre_end);
-        let states = simulation_smoother(&mut rng, &y_adj, sigma2_obs, sigma2_level);
+        let states = simulation_smoother(
+            &mut rng,
+            &y_adj,
+            sigma2_obs,
+            sigma2_level,
+            y[0],
+            y_sd * y_sd,
+        );
 
         // Step 2-3: (sigma2_obs, gamma, beta) sampling
         // Gibbs ordering depends on whether spike-and-slab is active:
@@ -433,8 +438,10 @@ fn sample_sigma2_obs<R: rand::Rng>(
     beta: &[f64],
     x: &[Vec<f64>],
 ) -> f64 {
-    let a_prior = 0.01;
-    let b_prior = 0.01;
+    let sigma_guess = sample_standard_deviation(y_pre);
+    let sample_size = 0.01;
+    let a_prior = sample_size / 2.0;
+    let b_prior = a_prior * sigma_guess * sigma_guess;
 
     let sse = y_pre
         .iter()
@@ -669,14 +676,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_standard_deviation_uses_sample_scale_because_prior_must_match_python_standardization() {
+    fn test_sample_standard_deviation_uses_sample_scale_because_prior_must_match_python_standardization(
+    ) {
         let values = vec![1.0, 2.0, 3.0];
         let sample_sd = sample_standard_deviation(&values);
         assert!((sample_sd - 1.0).abs() < 1e-12);
     }
 
     #[test]
-    fn test_sample_post_period_states_moves_after_pre_period_because_random_walk_noise_must_propagate() {
+    fn test_sample_post_period_states_moves_after_pre_period_because_random_walk_noise_must_propagate(
+    ) {
         let mut rng = StdRng::seed_from_u64(42);
         let states_post = sample_post_period_states(&mut rng, 10.0, 5, 0.1);
         let rounded_unique_states: std::collections::BTreeSet<i64> = states_post

@@ -9,11 +9,12 @@
   point_effect_mean     ±3%  相対誤差
   cumulative_effect     ±3%  相対誤差
   ci_lower / ci_upper
-    - no-covariates     ±3%  相対誤差
+    - no-covariates     ±1.5%  相対誤差
+      niter=50000での収束値 ~0.83%、MCMC分散 ±0.5% を考慮した閾値。
+      prior修正 (SdPrior sample.size=32) + post-period Random Walk 伝播による。
     - covariates        ±10% 相対誤差
+      spike-and-slab parity 完了まで Phase 2 扱い
     - Google R source の summary CI 定義とは整合済み
-    - no-covariates は prior/state propagation 修正後の目標値
-    - covariates は spike-and-slab parity 完了まで Phase 2 扱い
   p_value               有意性分類一致 (α=0.05)
 
 no_effect シナリオ（true_effect=0）:
@@ -32,16 +33,19 @@ from causal_impact import CausalImpact
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 # R: niter=5000, SuggestBurn(0.1) ≈ 500 → 4500 post-warmup
-# Python: niter=10000, nwarmup=1000 → 9000 post-warmup
+# Python: niter=20000, nwarmup=2000 → 18000 post-warmup
+# niter=20000 は CI bounds の MCMC 分散を ±0.5% 以内に抑えるために必要
 MCMC_ARGS = {
-    "niter": 10000,
-    "nwarmup": 1000,
+    "niter": 20000,
+    "nwarmup": 2000,
     "seed": 42,
     "prior_level_sd": 0.01,
 }
 
 TOL_POINT = 0.03  # ±3% for point estimates
-TOL_CI_NO_COV = 0.03  # ±3% for no-covariates CI bounds (MCMC variance)
+# ±1.5% for no-covariates CI bounds
+# (convergence ~0.83%, MCMC variance ±0.5%)
+TOL_CI_NO_COV = 0.015
 TOL_CI_COV = 0.10  # ±10% until Phase 2 spike-and-slab parity
 ABS_TOL_NO_EFFECT = 2.0  # absolute tolerance when true_effect=0
 
@@ -49,10 +53,7 @@ ABS_TOL_NO_EFFECT = 2.0  # absolute tolerance when true_effect=0
 def _load_fixture(scenario: str) -> dict:
     path = FIXTURES_DIR / f"r_reference_{scenario}.json"
     if not path.exists():
-        msg = (
-            f"R fixture not found: {path}. "
-            "Run scripts/generate_r_reference.R"
-        )
+        msg = f"R fixture not found: {path}. Run scripts/generate_r_reference.R"
         if os.environ.get("CI") == "true":
             pytest.fail(msg)
         else:
@@ -84,15 +85,11 @@ def _build_df(
 
 def _run_causal_impact(fixture: dict) -> dict:
     df, pre_period, post_period = _build_df(fixture)
-    ci = CausalImpact(
-        df, pre_period, post_period, model_args=MCMC_ARGS
-    )
+    ci = CausalImpact(df, pre_period, post_period, model_args=MCMC_ARGS)
     return ci.summary_stats
 
 
-def _assert_relative(
-    py_val: float, r_val: float, tol: float, metric: str
-) -> None:
+def _assert_relative(py_val: float, r_val: float, tol: float, metric: str) -> None:
     """相対誤差で比較。r_val ≈ 0 なら絶対誤差にフォールバック。"""
     abs_threshold = 0.5
     if abs(r_val) < abs_threshold:
@@ -109,14 +106,11 @@ def _assert_relative(
         )
 
 
-def _assert_absolute(
-    py_val: float, r_val: float, tol: float, metric: str
-) -> None:
+def _assert_absolute(py_val: float, r_val: float, tol: float, metric: str) -> None:
     """絶対誤差で比較。true_effect=0 シナリオ用。"""
     abs_diff = abs(py_val - r_val)
     assert abs_diff < tol, (
-        f"{metric}: abs diff {abs_diff:.6f} >= {tol}"
-        f" (py={py_val:.6f}, r={r_val:.6f})"
+        f"{metric}: abs diff {abs_diff:.6f} >= {tol} (py={py_val:.6f}, r={r_val:.6f})"
     )
 
 
@@ -160,16 +154,12 @@ class TestEquivalenceBasic:
     def test_ci_lower(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
-        _assert_relative(
-            py["ci_lower"], r["ci_lower"], TOL_CI_NO_COV, "ci_lower"
-        )
+        _assert_relative(py["ci_lower"], r["ci_lower"], TOL_CI_NO_COV, "ci_lower")
 
     def test_ci_upper(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
-        _assert_relative(
-            py["ci_upper"], r["ci_upper"], TOL_CI_NO_COV, "ci_upper"
-        )
+        _assert_relative(py["ci_upper"], r["ci_upper"], TOL_CI_NO_COV, "ci_upper")
 
     def test_cumulative_effect(self):
         fixture, py = _get_scenario(self.SCENARIO)
@@ -190,7 +180,10 @@ class TestEquivalenceCovariates:
     SCENARIO = "covariates"
 
     @pytest.mark.xfail(
-        reason="Phase 2: spike-and-slab parity needed for covariate points",
+        reason=(
+            "Phase 2: spike-and-slab parity is still required "
+            "for covariate point estimates"
+        ),
     )
     def test_point_effect_mean(self):
         fixture, py = _get_scenario(self.SCENARIO)
@@ -205,19 +198,18 @@ class TestEquivalenceCovariates:
     def test_ci_lower(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
-        _assert_relative(
-            py["ci_lower"], r["ci_lower"], TOL_CI_COV, "ci_lower"
-        )
+        _assert_relative(py["ci_lower"], r["ci_lower"], TOL_CI_COV, "ci_lower")
 
     def test_ci_upper(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
-        _assert_relative(
-            py["ci_upper"], r["ci_upper"], TOL_CI_COV, "ci_upper"
-        )
+        _assert_relative(py["ci_upper"], r["ci_upper"], TOL_CI_COV, "ci_upper")
 
     @pytest.mark.xfail(
-        reason="Phase 2: spike-and-slab parity needed for covariate cumulative",
+        reason=(
+            "Phase 2: spike-and-slab parity is still required "
+            "for covariate cumulative effects"
+        ),
     )
     def test_cumulative_effect(self):
         fixture, py = _get_scenario(self.SCENARIO)
@@ -250,16 +242,12 @@ class TestEquivalenceStrongEffect:
     def test_ci_lower(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
-        _assert_relative(
-            py["ci_lower"], r["ci_lower"], TOL_CI_NO_COV, "ci_lower"
-        )
+        _assert_relative(py["ci_lower"], r["ci_lower"], TOL_CI_NO_COV, "ci_lower")
 
     def test_ci_upper(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
-        _assert_relative(
-            py["ci_upper"], r["ci_upper"], TOL_CI_NO_COV, "ci_upper"
-        )
+        _assert_relative(py["ci_upper"], r["ci_upper"], TOL_CI_NO_COV, "ci_upper")
 
     def test_cumulative_effect(self):
         fixture, py = _get_scenario(self.SCENARIO)
@@ -336,9 +324,7 @@ class TestEquivalenceBoundary:
         with pytest.raises(pytest.skip.Exception):
             _load_fixture("nonexistent_scenario")
 
-    def test_fixture_missing_causes_fail_in_ci(
-        self, tmp_path, monkeypatch
-    ):
+    def test_fixture_missing_causes_fail_in_ci(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             "tests.test_numerical_equivalence.FIXTURES_DIR",
             tmp_path,

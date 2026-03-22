@@ -148,8 +148,9 @@ class TestSpikeSlabSelection:
         samples = _run_sampler_with_spike_slab(y, x, pre_end,
                                                 expected_model_size=0.5)
         probs = _inclusion_probs(samples)
-        msg = f"Strong signal inclusion prob {probs[0]} should be > 0.9"
-        assert probs[0] > 0.9, msg
+        assert probs[0] > 0.9, (
+            f"Strong signal inclusion prob {probs[0]} should be > 0.9"
+        )
 
     def test_spike_slab_k2_selects_signal_over_noise(self):
         """k=2: signal covariate has higher inclusion prob than noise."""
