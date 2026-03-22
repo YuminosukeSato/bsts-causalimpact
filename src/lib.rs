@@ -6,7 +6,7 @@ mod kalman;
 mod sampler;
 mod state_space;
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct GibbsSamples {
     #[pyo3(get)]
