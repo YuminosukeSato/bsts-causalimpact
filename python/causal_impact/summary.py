@@ -6,23 +6,20 @@ from causal_impact.analysis import CausalImpactResults
 
 
 class SummaryFormatter:
-    """Format CausalImpact results as text summary or natural language report."""
+    """Format CausalImpact results as text summary or report."""
 
     @staticmethod
     def summary(results: CausalImpactResults, digits: int = 2) -> str:
         fmt = f".{digits}f"
 
-        # Actual
         avg_actual = format(results.actual.mean(), fmt)
         cum_actual = format(results.actual.sum(), fmt)
 
-        # Prediction
         avg_pred = format(results.predictions_mean.mean(), fmt)
         avg_pred_sd = format(results.average_prediction_sd, fmt)
         cum_pred = format(results.predictions_mean.sum(), fmt)
         cum_pred_sd = format(results.cumulative_prediction_sd, fmt)
 
-        # Prediction CI
         avg_pred_ci = (
             f"[{format(results.average_prediction_lower, fmt)}, "
             f"{format(results.average_prediction_upper, fmt)}]"
@@ -32,13 +29,11 @@ class SummaryFormatter:
             f"{format(results.cumulative_prediction_upper, fmt)}]"
         )
 
-        # Absolute effect
         avg_eff = format(results.point_effect_mean, fmt)
         avg_eff_sd = format(results.average_effect_sd, fmt)
         cum_eff = format(results.cumulative_effect_total, fmt)
         cum_eff_sd = format(results.cumulative_effect_sd, fmt)
 
-        # Absolute effect CI
         avg_eff_ci = (
             f"[{format(results.ci_lower, fmt)}, {format(results.ci_upper, fmt)}]"
         )
@@ -47,7 +42,6 @@ class SummaryFormatter:
             f"{format(results.cumulative_effect_upper[-1], fmt)}]"
         )
 
-        # Relative effect
         rel_m = format(results.relative_effect_mean * 100, fmt)
         rel_sd = format(results.relative_effect_sd * 100, fmt)
         rel_lo = format(results.relative_effect_lower * 100, fmt)

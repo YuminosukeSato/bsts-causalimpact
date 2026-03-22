@@ -6,7 +6,6 @@ from causal_impact.summary import SummaryFormatter
 
 
 def _make_results(effect=2.0, p_value=0.01):
-    """Create a CausalImpactResults fixture."""
     t_post = 10
     return CausalImpactResults(
         actual=np.full(t_post, 12.0),
@@ -41,8 +40,6 @@ def _make_results(effect=2.0, p_value=0.01):
 
 
 class TestSummaryFormat:
-    """summary出力フォーマット."""
-
     def test_summary_default_format(self):
         result = _make_results(effect=2.0, p_value=0.01)
         text = SummaryFormatter.summary(result, digits=2)
@@ -51,7 +48,6 @@ class TestSummaryFormat:
         assert "2.0" in text or "2.00" in text
 
     def test_summary_includes_r_style_sections(self):
-        """R互換summary: Actual/Prediction/Absolute/Relativeの各行を表示."""
         result = _make_results(effect=2.0, p_value=0.01)
 
         text = SummaryFormatter.summary(result, digits=2)
@@ -68,22 +64,20 @@ class TestSummaryFormat:
     def test_summary_report_format(self):
         result = _make_results(effect=2.0, p_value=0.01)
         text = SummaryFormatter.report(result)
-        # Report should be natural language
         assert len(text) > 100
         assert "effect" in text.lower() or "impact" in text.lower()
 
     def test_summary_digits_0(self):
         result = _make_results(effect=2.345, p_value=0.01)
         text = SummaryFormatter.summary(result, digits=0)
-        assert "2.345" not in text  # should be rounded
+        assert "2.345" not in text
 
     def test_summary_digits_10(self):
         result = _make_results(effect=2.0, p_value=0.01)
         text = SummaryFormatter.summary(result, digits=10)
         assert isinstance(text, str)
 
-    def test_summary_shows_cumulative_ci_in_95_percent_ci_row(self):
-        """Absolute effect の 95% CI 行 cumulative 列には最終時点の累積CIを表示する."""
+    def test_summary_shows_cumulative_ci_in_effect_row(self):
         result = _make_results(effect=2.0, p_value=0.01)
         text = SummaryFormatter.summary(result, digits=2)
         ci_line = text.split("\n")[8]
@@ -92,8 +86,6 @@ class TestSummaryFormat:
 
 
 class TestReportContent:
-    """レポート内容の検証."""
-
     def test_report_significant_effect(self):
         result = _make_results(effect=3.0, p_value=0.001)
         text = SummaryFormatter.report(result)

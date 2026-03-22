@@ -6,7 +6,6 @@ from causal_impact.plot import Plotter
 
 
 def _make_results_with_index():
-    """Create results and time index for plotting."""
     import pandas as pd
 
     t_pre = 70
@@ -49,8 +48,6 @@ def _make_results_with_index():
 
 
 class TestPlot:
-    """Plotのテスト."""
-
     def test_plot_3_panels(self):
         import matplotlib
 
@@ -75,11 +72,9 @@ class TestPlot:
         matplotlib.use("Agg")
         results, y, time_index, t_pre = _make_results_with_index()
         fig = Plotter.plot(results, y, time_index, t_pre)
-        # Check that vertical lines exist in each subplot
         axes = fig.get_axes()
         for ax in axes:
             lines = ax.get_lines()
-            # At least the intervention vertical line should be present
             assert len(lines) >= 1
 
     def test_plot_pointwise_panel_draws_ci_band(self):
