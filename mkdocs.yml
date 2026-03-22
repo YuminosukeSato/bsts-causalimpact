@@ -15,6 +15,7 @@ theme:
 
 nav:
   - Getting Started: index.md
+  - Examples: examples.md
   - API Reference: api.md
   - Migration from R: migration-from-r.md
   - Migration from tfp: migration-from-tfp.md
