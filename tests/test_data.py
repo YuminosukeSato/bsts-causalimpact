@@ -10,9 +10,7 @@ class TestValidateDataFrameInput:
     """DataFrameの入力バリデーション."""
 
     def test_validate_dataframe_valid(self, sample_df, pre_period, post_period):
-        result = DataProcessor.validate_and_prepare(
-            sample_df, pre_period, post_period
-        )
+        result = DataProcessor.validate_and_prepare(sample_df, pre_period, post_period)
         assert isinstance(result, PreparedData)
 
     def test_validate_numpy_array(self, rng, pre_period_int, post_period_int):
@@ -22,9 +20,7 @@ class TestValidateDataFrameInput:
         )
         assert isinstance(result, PreparedData)
 
-    def test_validate_single_column(
-        self, sample_df_no_cov, pre_period, post_period
-    ):
+    def test_validate_single_column(self, sample_df_no_cov, pre_period, post_period):
         result = DataProcessor.validate_and_prepare(
             sample_df_no_cov, pre_period, post_period
         )
@@ -104,9 +100,7 @@ class TestStandardization:
     """標準化と逆標準化."""
 
     def test_standardize_and_restore(self, sample_df, pre_period, post_period):
-        result = DataProcessor.validate_and_prepare(
-            sample_df, pre_period, post_period
-        )
+        result = DataProcessor.validate_and_prepare(sample_df, pre_period, post_period)
         # 標準化されたy_preの平均≈0, 標準偏差≈1
         assert abs(result.y_pre.mean()) < 0.3
         assert abs(result.y_pre.std() - 1.0) < 0.3
@@ -168,9 +162,7 @@ class TestIndexParsing:
     """インデックス解析."""
 
     def test_date_index_string(self, sample_df, pre_period, post_period):
-        result = DataProcessor.validate_and_prepare(
-            sample_df, pre_period, post_period
-        )
+        result = DataProcessor.validate_and_prepare(sample_df, pre_period, post_period)
         assert isinstance(result.time_index, pd.DatetimeIndex)
 
     def test_date_index_integer(self, rng, pre_period_int, post_period_int):

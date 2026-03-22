@@ -185,9 +185,7 @@ class DataProcessor:
         return pre_start, pre_end, post_start, post_end
 
     @staticmethod
-    def _validate_periods(
-        pre_start, pre_end, post_start, post_end, time_index
-    ) -> None:
+    def _validate_periods(pre_start, pre_end, post_start, post_end, time_index) -> None:
         idx_min = time_index.min()
         idx_max = time_index.max()
 

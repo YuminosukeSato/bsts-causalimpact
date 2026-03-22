@@ -25,6 +25,7 @@ DEFAULT_MODEL_ARGS = {
     "standardize_data": True,
     "prior_level_sd": 0.01,
     "expected_model_size": 2,
+    "dynamic_regression": False,
     "nseasons": None,
     "season_duration": None,
 }
@@ -100,6 +101,7 @@ class CausalImpact:
             expected_model_size=float(args["expected_model_size"]),
             nseasons=args["nseasons"],
             season_duration=args["season_duration"],
+            dynamic_regression=bool(args.get("dynamic_regression", False)),
         )
 
     def _compute_results(self, prepared: PreparedData, samples) -> CausalImpactResults:
