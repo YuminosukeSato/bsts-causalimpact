@@ -19,6 +19,7 @@ class ModelOptions:
     standardize_data: bool = True
     prior_level_sd: float = 0.01
     expected_model_size: int = 1
+    dynamic_regression: bool = False
     nseasons: int | None = None
     season_duration: int | None = None
 
@@ -37,6 +38,12 @@ class ModelOptions:
             raise ValueError(msg)
         if self.expected_model_size <= 0:
             msg = f"expected_model_size must be > 0, got {self.expected_model_size}"
+            raise ValueError(msg)
+        if not isinstance(self.dynamic_regression, bool):
+            msg = (
+                "dynamic_regression must be a bool, "
+                f"got {type(self.dynamic_regression).__name__}"
+            )
             raise ValueError(msg)
         if self.nseasons is not None:
             if not isinstance(self.nseasons, int):
