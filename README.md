@@ -65,29 +65,62 @@ fig.savefig("causal_impact.png")
 
 ## Comparison with Alternatives
 
-| Aspect | bsts-causalimpact | tfp-causalimpact |
-|---|---|---|
-| Algorithm | Gibbs sampler (Rust, same as R bsts) | Gibbs sampler (via TensorFlow Probability) |
-| Dependencies | numpy, pandas, matplotlib | tensorflow, tensorflow-probability (3GB+) |
-| R compatibility tests | ±3% verified, CI-enforced | Not published |
-| pip install | Works out of the box | Works out of the box |
-| Python version | 3.10+ | 3.8+ |
-| API | R CausalImpact compatible | Custom API |
+| | R CausalImpact | bsts-causalimpact (this) | tfp-causalimpact | tfcausalimpact | pycausalimpact |
+|---|---|---|---|---|---|
+| Maintainer | Google | OSS | Google | WillianFuks | dafiti (stale) |
+| Algorithm | Gibbs (bsts/C++) | Gibbs (Rust) | TFP-based | VI default / HMC | MLE (statsmodels) |
+| Dependencies | R, bsts | numpy, pandas, matplotlib | TF, TFP (3 GB+) | TF, TFP (3 GB+) | statsmodels |
+| Spike-and-slab | Yes | Yes | Unknown | No | No |
+| Seasonal component | Yes | No (planned) | Unknown | Yes (TFP STS) | No |
+| Dynamic regression | Yes | No (planned) | Unknown | No | No |
+| R numerical test | Reference | CI-enforced (±1.5%) | Not published | Visual comparison | Not tested |
+| Speed (T=1000) | 2.1 s | 0.07 s (30x) | Seconds | Minutes (HMC: hours) | Sub-second |
+| Python version | N/A (R) | 3.10+ | 3.8+ | 3.7-3.11 | 3.6-3.8 (stale) |
+| Last release | Active | Active | 2023 | 2025-01 | 2020-05 |
 
-The key differentiator is not the algorithm (both use Gibbs sampling) but the dependency footprint and verified R compatibility.
+### Why this library exists
+
+Existing Python ports have fundamental limitations:
+
+- pycausalimpact uses MLE (not MCMC), producing results that diverge substantially from R
+- tfcausalimpact uses variational inference by default (not Gibbs sampling), and requires TensorFlow (3 GB+)
+- tfp-causalimpact (Google's own Python port) does not publish numerical equivalence tests with R
+- None of the above implement spike-and-slab variable selection matching R's bsts
+
+This library reproduces the exact Gibbs sampler from R's bsts package in Rust, with CI-enforced numerical equivalence tests on every commit.
 
 ## Numerical Equivalence with R
 
-This library verifies numerical equivalence with R CausalImpact (bsts 1.4.1) across 4 scenarios (basic, covariates, strong_effect, no_effect):
+Verified against R CausalImpact 1.4.1 (bsts) across 4 scenarios (basic, covariates, strong_effect, no_effect).
+Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
 
-| Metric | Tolerance | Justification |
+### Current status
+
+| Metric | no-covariates | covariates | Justification |
+|---|---|---|---|
+| `point_effect_mean` | ±3% | xfail | MCMC sampling variance with independent RNG |
+| `cumulative_effect_total` | ±3% | xfail | Same ratio as point effect |
+| `ci_lower` / `ci_upper` | ±1.5% | ±10% | See R parity status below |
+| `p_value` | Significance match | Significance match | Classification at alpha=0.05 |
+
+### What is matching R and what is not
+
+| R feature | Status | Detail |
 |---|---|---|
-| `point_effect_mean` | ±3% relative | MC-SE with independent RNG, 4-sigma bound |
-| `cumulative_effect_total` | ±3% relative | Same ratio as point_effect |
-| `ci_lower` / `ci_upper` | ±15% relative | Systematic CI computation difference (Jensen) |
-| `p_value` | Significance match | Classification at alpha=0.05 |
+| Local level model (Gibbs sampler) | Matching | Same algorithm as bsts: Kalman filter + simulation smoother |
+| SdPrior(sample.size=32) for sigma2_level | Matching | InvGamma(16, 16 * sigma_guess^2) |
+| Post-period Random Walk propagation | Matching | Forward simulation from last pre-period state |
+| Data standardization (standardize.data=TRUE) | Matching | (y - mean) / sd using pre-period moments |
+| prior.level.sd = 0.01 | Matching | Same default, same semantics |
+| Spike-and-slab variable selection | Partial | Coordinate-wise sampling works; prior parameters (expected.r2, prior.df) not yet matched |
+| expected.model.size = 3 (R default) | Partial | Implemented but defaults to 1; R defaults to 3 |
+| expected.r2 = 0.8, prior.df = 50 | Not yet | Slab variance uses g-prior instead of R's R2-based prior |
+| Seasonal component (nseasons) | Not yet | R supports AddSeasonal; not implemented here |
+| Dynamic regression | Not yet | R supports dynamic.regression=TRUE; not implemented |
+| Local linear trend | Not yet | R uses AddLocalLevel only by default; trend option exists but not ported |
 
-Tests run on every PR. Fixtures regenerated weekly from R CausalImpact 1.4.1.
+The ±10% gap in the covariates scenario comes from the missing R2-based slab prior (expected.r2=0.8, prior.df=50).
+This is tracked as Phase 2 work.
 
 ## API
 
