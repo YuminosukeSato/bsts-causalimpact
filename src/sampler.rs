@@ -1,6 +1,7 @@
 use crate::distributions::{sample_inv_gamma, sample_mvnormal, sample_normal};
 use crate::kalman::simulation_smoother;
 use crate::state_space::StateSpaceModel;
+use rand::distributions::Bernoulli;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
@@ -13,6 +14,7 @@ struct ChainResult {
     sigma_obs: Vec<f64>,
     sigma_level: Vec<f64>,
     beta: Vec<Vec<f64>>,
+    gamma: Vec<Vec<bool>>,
     predictions: Vec<Vec<f64>>,
 }
 
@@ -21,6 +23,7 @@ pub struct GibbsResult {
     pub sigma_obs: Vec<f64>,
     pub sigma_level: Vec<f64>,
     pub beta: Vec<Vec<f64>>,
+    pub gamma: Vec<Vec<bool>>,
     pub predictions: Vec<Vec<f64>>,
 }
 
@@ -34,8 +37,16 @@ pub fn run_sampler(
     nchains: usize,
     seed: u64,
     prior_level_sd: f64,
+    expected_model_size: f64,
 ) -> Result<GibbsResult, String> {
     validate_inputs(&y, pre_end, nchains)?;
+
+    let k = x.len();
+    if k > 0 && expected_model_size <= 0.0 {
+        return Err(
+            "expected_model_size must be > 0 when covariates are present".to_string(),
+        );
+    }
 
     let model = StateSpaceModel::new(y.clone(), x);
     let n_samples = niter * nchains;
@@ -51,6 +62,7 @@ pub fn run_sampler(
                 seed,
                 prior_level_sd,
                 chain_id,
+                expected_model_size,
             )
         })
         .collect();
@@ -91,27 +103,82 @@ fn run_single_chain(
     seed: u64,
     prior_level_sd: f64,
     chain_id: usize,
+    expected_model_size: f64,
 ) -> ChainResult {
     let t_total = y.len();
+    let k = model.num_covariates();
+    let y_sd = sample_standard_deviation(&y[..pre_end]);
     let chain_seed = seed ^ (chain_id as u64).wrapping_mul(SEED_PRIME);
     let mut rng = StdRng::seed_from_u64(chain_seed);
     let mut sigma2_obs = 1.0;
     let mut sigma2_level = (prior_level_sd * prior_level_sd).max(1e-6);
-    let mut beta = vec![0.0; model.num_covariates()];
+    let mut beta = vec![0.0; k];
+    let mut gamma = vec![true; k];
     let mut chain_result = ChainResult {
         chain_id,
         states: Vec::with_capacity(niter),
         sigma_obs: Vec::with_capacity(niter),
         sigma_level: Vec::with_capacity(niter),
         beta: Vec::with_capacity(niter),
+        gamma: Vec::with_capacity(niter),
         predictions: Vec::with_capacity(niter),
     };
 
+    // Compute pi and log_prior_odds once
+    let pi = if k > 0 {
+        (expected_model_size / k as f64).min(1.0)
+    } else {
+        1.0
+    };
+    let use_spike_slab = k > 0 && pi < 1.0;
+    let log_prior_odds = if use_spike_slab {
+        (pi / (1.0 - pi)).ln()
+    } else {
+        0.0
+    };
+    let g = pre_end as f64; // Zellner's g-prior parameter
+
     for iter in 0..(niter + nwarmup) {
+        // Step 1: State sampling (simulation smoother)
         let y_adj = adjusted_observations(y, model, &beta, pre_end);
         let states = simulation_smoother(&mut rng, &y_adj, sigma2_obs, sigma2_level);
 
-        if model.num_covariates() > 0 {
+        // Step 2-3: (sigma2_obs, gamma, beta) sampling
+        // Gibbs ordering depends on whether spike-and-slab is active:
+        // - spike-and-slab: sample sigma2_obs BEFORE beta to prevent
+        //   sigma2_obs spikes when beta jumps from 0 (excluded) to nonzero (included)
+        // - blocked g-prior (pi>=1.0): sample beta BEFORE sigma2_obs
+        //   (original ordering, preserves backward compatibility)
+        if k > 0 && use_spike_slab {
+            sigma2_obs =
+                sample_sigma2_obs(&mut rng, &y[..pre_end], &states, &beta, model.covariates());
+
+            let mut residual: Vec<f64> = y[..pre_end]
+                .iter()
+                .zip(states.iter())
+                .map(|(y_val, s)| y_val - s)
+                .collect();
+            for j in 0..k {
+                let x_col = &model.covariates()[j];
+                for (t, r) in residual.iter_mut().enumerate().take(pre_end) {
+                    *r -= x_col[t] * beta[j];
+                }
+            }
+
+            sample_spike_and_slab(
+                &mut rng,
+                &mut gamma,
+                &mut beta,
+                &mut residual,
+                model.covariates(),
+                k,
+                pre_end,
+                sigma2_obs,
+                g,
+                log_prior_odds,
+            );
+        } else if k > 0 {
+            // pi >= 1.0: all variables always included (backward compatible)
             beta = sample_beta(
                 &mut rng,
                 &y[..pre_end],
@@ -119,20 +186,37 @@ fn run_single_chain(
                 model.covariates(),
                 sigma2_obs,
             );
+            for gj in gamma.iter_mut() {
+                *gj = true;
+            }
+            sigma2_obs =
+                sample_sigma2_obs(&mut rng, &y[..pre_end], &states, &beta, model.covariates());
+        } else {
+            sigma2_obs =
+                sample_sigma2_obs(&mut rng, &y[..pre_end], &states, &beta, model.covariates());
         }
 
-        sigma2_obs = sample_sigma2_obs(&mut rng, &y[..pre_end], &states, &beta, model.covariates());
-        sigma2_level = sample_sigma2_level(&mut rng, &states, pre_end, prior_level_sd);
+        // Step 4: sigma^2_level sampling
+        sigma2_level = sample_sigma2_level(&mut rng, &states, pre_end, prior_level_sd, y_sd);
 
         if iter >= nwarmup {
-            let full_states = extend_states_to_full(&states, pre_end, t_total);
+            let states_post = sample_post_period_states(
+                &mut rng,
+                states[pre_end - 1],
+                t_total - pre_end,
+                sigma2_level,
+            );
+            let full_states = combine_state_paths(&states, &states_post);
             let predictions =
-                generate_predictions(&full_states, &beta, model, pre_end, sigma2_obs, &mut rng);
+                generate_predictions(&states_post, &beta, model, pre_end, sigma2_obs, &mut rng);
 
             chain_result.states.push(full_states);
             chain_result.sigma_obs.push(sigma2_obs.sqrt());
             chain_result.sigma_level.push(sigma2_level.sqrt());
             chain_result.beta.push(beta.clone());
+            if k > 0 {
+                chain_result.gamma.push(gamma.clone());
+            }
             chain_result.predictions.push(predictions);
         }
     }
@@ -148,6 +232,7 @@ fn flatten_chain_results(mut chain_results: Vec<ChainResult>, n_samples: usize) 
         sigma_obs: Vec::with_capacity(n_samples),
         sigma_level: Vec::with_capacity(n_samples),
         beta: Vec::with_capacity(n_samples),
+        gamma: Vec::with_capacity(n_samples),
         predictions: Vec::with_capacity(n_samples),
     };
 
@@ -156,6 +241,7 @@ fn flatten_chain_results(mut chain_results: Vec<ChainResult>, n_samples: usize) 
         result.sigma_obs.extend(chain_result.sigma_obs);
         result.sigma_level.extend(chain_result.sigma_level);
         result.beta.extend(chain_result.beta);
+        result.gamma.extend(chain_result.gamma);
         result.predictions.extend(chain_result.predictions);
     }
 
@@ -239,6 +325,107 @@ fn sample_beta<R: rand::Rng>(
     sample_mvnormal(rng, &mean, &covariance)
 }
 
+/// Coordinate-wise spike-and-slab sampling for (gamma, beta).
+///
+/// For each covariate j:
+///   1. Add back x_j * beta_j to get partial residual r_j
+///   2. Compute log Bayes factor for inclusion using centered statistics
+///   3. Sample gamma_j from Bernoulli(sigmoid(log_prior_odds + log_bf))
+///   4. If included: sample beta_j from posterior; otherwise set beta_j = 0
+///   5. Subtract x_j * new_beta_j from residual
+///
+/// Uses centered sum of squares: n_j = Σ(x_j - x̄_j)²
+/// This ensures the Bayes factor is invariant to the location of x_j,
+/// matching R's bsts which standardizes covariates before spike-and-slab.
+#[allow(clippy::too_many_arguments)]
+fn sample_spike_and_slab<R: rand::Rng>(
+    rng: &mut R,
+    gamma: &mut [bool],
+    beta: &mut [f64],
+    residual: &mut [f64],
+    x: &[Vec<f64>],
+    k: usize,
+    t_pre: usize,
+    sigma2_obs: f64,
+    g: f64,
+    log_prior_odds: f64,
+) {
+    let one_plus_g = 1.0 + g;
+    let log_shrinkage = -0.5 * one_plus_g.ln(); // 0.5 * log(1/(1+g))
+    let t_pre_f = t_pre as f64;
+
+    for j in 0..k {
+        let x_col = &x[j];
+        let old_beta_j = beta[j];
+
+        // Rank-1 update: add back old contribution to get partial residual
+        for (t, r) in residual.iter_mut().enumerate().take(t_pre) {
+            *r += x_col[t] * old_beta_j;
+        }
+
+        // Compute centered statistics for covariate j
+        let x_sum: f64 = x_col.iter().take(t_pre).sum();
+        let x_mean = x_sum / t_pre_f;
+        let sum_x2: f64 = x_col.iter().take(t_pre).map(|v| v * v).sum();
+        // Centered sum of squares: Σ(x_j - x̄)² = Σx² - T*x̄²
+        let n_j = sum_x2 - t_pre_f * x_mean * x_mean;
+
+        // Guard against zero/near-zero variance covariates
+        if n_j < 1e-12 {
+            gamma[j] = false;
+            beta[j] = 0.0;
+            for (t, r) in residual.iter_mut().enumerate().take(t_pre) {
+                *r -= x_col[t] * beta[j];
+            }
+            continue;
+        }
+
+        // Centered cross-product: Σ(x_j - x̄) * r = Σ x_j*r - x̄ * Σr
+        let xtr_raw: f64 = x_col
+            .iter()
+            .zip(residual.iter())
+            .take(t_pre)
+            .map(|(x_val, r_val)| x_val * r_val)
+            .sum();
+        let r_sum: f64 = residual.iter().take(t_pre).sum();
+        let xtr_j = xtr_raw - x_mean * r_sum;
+
+        // Log Bayes factor: log_shrinkage + 0.5 * (x̃_j^T r_j)² / (ñ_j * σ²_obs * (1+g))
+        let log_bf = log_shrinkage + 0.5 * xtr_j * xtr_j / (n_j * sigma2_obs * one_plus_g);
+
+        // Log odds of inclusion
+        let log_odds = log_prior_odds + log_bf;
+
+        // Stable sigmoid: avoid exp overflow
+        let include = if log_odds > 40.0 {
+            true
+        } else if log_odds < -40.0 {
+            false
+        } else {
+            let prob = 1.0 / (1.0 + (-log_odds).exp());
+            let dist = Bernoulli::new(prob).unwrap_or_else(|_| Bernoulli::new(0.5).unwrap());
+            rng.sample(dist)
+        };
+
+        gamma[j] = include;
+
+        if include {
+            // Posterior: beta_j | gamma_j=1 ~ N(mu_j, sigma2_j)
+            // Using centered statistics for the slab
+            let mu_j = xtr_j * g / (n_j * one_plus_g);
+            let sigma2_j = sigma2_obs * g / (n_j * one_plus_g);
+            beta[j] = sample_normal(rng, mu_j, sigma2_j);
+        } else {
+            beta[j] = 0.0;
+        }
+
+        // Rank-1 update: subtract new contribution
+        for (t, r) in residual.iter_mut().enumerate().take(t_pre) {
+            *r -= x_col[t] * beta[j];
+        }
+    }
+}
+
 fn sample_sigma2_obs<R: rand::Rng>(
     rng: &mut R,
     y_pre: &[f64],
@@ -274,9 +461,12 @@ fn sample_sigma2_level<R: rand::Rng>(
     states: &[f64],
     pre_end: usize,
     prior_level_sd: f64,
+    y_sd: f64,
 ) -> f64 {
-    let a_prior = 0.5;
-    let b_prior = 0.5 * prior_level_sd * prior_level_sd;
+    let sigma_guess = prior_level_sd * y_sd;
+    let sample_size = 32.0;
+    let a_prior = sample_size / 2.0;
+    let b_prior = a_prior * sigma_guess * sigma_guess;
     let ssd = states[..pre_end]
         .windows(2)
         .map(|window| {
@@ -290,25 +480,65 @@ fn sample_sigma2_level<R: rand::Rng>(
     sample_inv_gamma(rng, shape, scale).max(1e-12)
 }
 
-fn extend_states_to_full(states_pre: &[f64], pre_end: usize, t_total: usize) -> Vec<f64> {
-    let mut full = vec![states_pre[pre_end - 1]; t_total];
-    full[..pre_end].copy_from_slice(&states_pre[..pre_end]);
-    full
+fn sample_standard_deviation(values: &[f64]) -> f64 {
+    if values.len() <= 1 {
+        return 1.0;
+    }
+
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    let centered_sum_of_squares = values
+        .iter()
+        .map(|value| {
+            let centered = value - mean;
+            centered * centered
+        })
+        .sum::<f64>();
+    let variance = centered_sum_of_squares / (n - 1.0);
+    if variance <= 0.0 {
+        1.0
+    } else {
+        variance.sqrt()
+    }
+}
+
+fn sample_post_period_states<R: rand::Rng>(
+    rng: &mut R,
+    last_pre_state: f64,
+    post_len: usize,
+    sigma2_level: f64,
+) -> Vec<f64> {
+    let mut current_state = last_pre_state;
+    (0..post_len)
+        .map(|_| {
+            current_state += sample_normal(rng, 0.0, sigma2_level);
+            current_state
+        })
+        .collect()
+}
+
+fn combine_state_paths(states_pre: &[f64], states_post: &[f64]) -> Vec<f64> {
+    let mut full_states = Vec::with_capacity(states_pre.len() + states_post.len());
+    full_states.extend_from_slice(states_pre);
+    full_states.extend_from_slice(states_post);
+    full_states
 }
 
 fn generate_predictions<R: rand::Rng>(
-    states: &[f64],
+    states_post: &[f64],
     beta: &[f64],
     model: &StateSpaceModel,
     pre_end: usize,
     sigma2_obs: f64,
     rng: &mut R,
 ) -> Vec<f64> {
-    states
+    states_post
         .iter()
         .enumerate()
-        .skip(pre_end)
-        .map(|(t, state)| model.observe(t, *state, beta) + sample_normal(rng, 0.0, sigma2_obs))
+        .map(|(offset, state)| {
+            let t = pre_end + offset;
+            model.observe(t, *state, beta) + sample_normal(rng, 0.0, sigma2_obs)
+        })
         .collect()
 }
 
@@ -394,33 +624,66 @@ mod tests {
     #[test]
     fn test_run_sampler_basic() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
-        let result = run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01).unwrap();
+        let result = run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0).unwrap();
         assert_eq!(result.states.len(), 10);
         assert_eq!(result.sigma_obs.len(), 10);
         assert_eq!(result.predictions.len(), 10);
         assert_eq!(result.predictions[0].len(), 5);
+        assert!(result.gamma.is_empty() || result.gamma[0].is_empty());
     }
 
     #[test]
     fn test_run_sampler_with_covariates() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
-        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01).unwrap();
+        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0).unwrap();
         assert_eq!(result.beta.len(), 10);
         assert_eq!(result.beta[0].len(), 1);
+        assert_eq!(result.gamma.len(), 10);
+        assert_eq!(result.gamma[0].len(), 1);
     }
 
     #[test]
     fn test_run_sampler_empty_y() {
-        let result = run_sampler(vec![], vec![], 0, 10, 5, 1, 42, 0.01);
+        let result = run_sampler(vec![], vec![], 0, 10, 5, 1, 42, 0.01, 1.0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_run_sampler_pre_end_equals_t() {
         let y: Vec<f64> = vec![1.0, 2.0, 3.0];
-        let result = run_sampler(y, vec![], 3, 10, 5, 1, 42, 0.01);
+        let result = run_sampler(y, vec![], 3, 10, 5, 1, 42, 0.01, 1.0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_sampler_expected_model_size_validation() {
+        let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
+        let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
+        // k>0 with expected_model_size=0 should fail
+        let result = run_sampler(y.clone(), vec![x1.clone()], 15, 10, 5, 1, 42, 0.01, 0.0);
+        assert!(result.is_err());
+        // k>0 with negative should fail
+        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, -1.0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sample_standard_deviation_uses_sample_scale_because_prior_must_match_python_standardization() {
+        let values = vec![1.0, 2.0, 3.0];
+        let sample_sd = sample_standard_deviation(&values);
+        assert!((sample_sd - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_sample_post_period_states_moves_after_pre_period_because_random_walk_noise_must_propagate() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let states_post = sample_post_period_states(&mut rng, 10.0, 5, 0.1);
+        let rounded_unique_states: std::collections::BTreeSet<i64> = states_post
+            .iter()
+            .map(|state| (state * 1_000_000_000.0).round() as i64)
+            .collect();
+        assert!(rounded_unique_states.len() > 1);
     }
 
     #[test]

@@ -18,11 +18,13 @@ pub struct GibbsSamples {
     #[pyo3(get)]
     pub beta: Vec<Vec<f64>>,
     #[pyo3(get)]
+    pub gamma: Vec<Vec<bool>>,
+    #[pyo3(get)]
     pub predictions: Vec<Vec<f64>>,
 }
 
 #[pyfunction]
-#[pyo3(signature = (y, x, pre_end, niter, nwarmup, nchains, seed, prior_level_sd))]
+#[pyo3(signature = (y, x, pre_end, niter, nwarmup, nchains, seed, prior_level_sd, expected_model_size=1.0))]
 #[allow(clippy::too_many_arguments)]
 fn run_gibbs_sampler(
     y: Vec<f64>,
@@ -33,6 +35,7 @@ fn run_gibbs_sampler(
     nchains: usize,
     seed: u64,
     prior_level_sd: f64,
+    expected_model_size: f64,
 ) -> PyResult<GibbsSamples> {
     let x_vecs: Vec<Vec<f64>> = match x {
         Some(list) => {
@@ -55,6 +58,7 @@ fn run_gibbs_sampler(
         nchains,
         seed,
         prior_level_sd,
+        expected_model_size,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
@@ -63,6 +67,7 @@ fn run_gibbs_sampler(
         sigma_obs: result.sigma_obs,
         sigma_level: result.sigma_level,
         beta: result.beta,
+        gamma: result.gamma,
         predictions: result.predictions,
     })
 }
