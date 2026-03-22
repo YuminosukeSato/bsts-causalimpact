@@ -2,5 +2,6 @@
 
 from causal_impact._core import __version__
 from causal_impact.main import CausalImpact
+from causal_impact.options import ModelOptions
 
-__all__ = ["CausalImpact", "__version__"]
+__all__ = ["CausalImpact", "ModelOptions", "__version__"]

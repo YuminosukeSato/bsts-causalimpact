@@ -10,6 +10,7 @@ import pandas as pd
 from causal_impact._core import run_gibbs_sampler
 from causal_impact.analysis import CausalAnalysis, CausalImpactResults
 from causal_impact.data import DataProcessor, PreparedData
+from causal_impact.options import ModelOptions
 from causal_impact.plot import Plotter
 from causal_impact.summary import SummaryFormatter
 
@@ -43,10 +44,13 @@ class CausalImpact:
         data: pd.DataFrame | np.ndarray,
         pre_period: list[str | int | pd.Timestamp],
         post_period: list[str | int | pd.Timestamp],
-        model_args: dict | None = None,
+        model_args: dict | ModelOptions | None = None,
         alpha: float = 0.05,
     ) -> None:
-        args = {**DEFAULT_MODEL_ARGS, **(model_args or {})}
+        if isinstance(model_args, ModelOptions):
+            args = {**DEFAULT_MODEL_ARGS, **model_args.to_dict()}
+        else:
+            args = {**DEFAULT_MODEL_ARGS, **(model_args or {})}
         standardize = args.pop("standardize_data")
 
         self._prepared = DataProcessor.validate_and_prepare(
