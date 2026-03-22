@@ -135,6 +135,12 @@ src/ (Rust)
     distributions.rs      # Posterior sampling distributions
 ```
 
+## Setup
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Running Tests
 
 ```bash
