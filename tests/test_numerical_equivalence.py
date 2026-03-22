@@ -1,0 +1,333 @@
+"""R CausalImpact (bsts) との数値同値性テスト.
+
+証明の根拠:
+  Local Level Model + 同一事前分布 + 同一共役更新規則
+  → niter 十分大で同一の真後験分布に収束（MCMC エルゴード定理）
+  → 指標別許容幅で数値同値性を確認
+
+許容誤差（実測 MC 分散に基づく修正版）:
+  point_effect_mean     ±3%  相対誤差
+    - R/Python は異なる RNG → 独立 MC 推定の差の SE = √2 × MC-SE
+    - MCMC 自己相関により n_eff ≈ 0.3-0.5 × niter
+    - 2 つの独立推定の差の 4σ ≈ 2.7% (n_eff=2000, σ/μ=0.15)
+  cumulative_effect     ±3%  相対誤差
+    point_effect_mean の T_post 倍。比率は同じ。
+  ci_lower / ci_upper   ±15% 相対誤差
+    CI 計算方法に体系的差異あり:
+    - R: 各時点の分位点を計算 → 時間平均
+    - Python: サンプル毎に時間平均 → 分位点
+    - Jensen 不等式より E[Q(X_t)] ≠ Q(E[X_t])
+  p_value               有意性分類一致 (α=0.05)
+
+no_effect シナリオ（true_effect=0）:
+  効果 ≈ 0 のため相対誤差が発散。絶対誤差 < 2.0 で比較。
+"""
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+from causal_impact import CausalImpact
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+# R: niter=5000, SuggestBurn(0.1) ≈ 500 → 4500 post-warmup
+# Python: niter=10000, nwarmup=1000 → 9000 post-warmup
+MCMC_ARGS = {
+    "niter": 10000,
+    "nwarmup": 1000,
+    "seed": 42,
+    "prior_level_sd": 0.01,
+}
+
+TOL_POINT = 0.03  # ±3% for point estimates
+TOL_CI = 0.15  # ±15% for CI bounds
+ABS_TOL_NO_EFFECT = 2.0  # absolute tolerance when true_effect=0
+
+
+def _load_fixture(scenario: str) -> dict:
+    path = FIXTURES_DIR / f"r_reference_{scenario}.json"
+    if not path.exists():
+        pytest.skip(
+            f"R fixture not found: {path}. "
+            "Run scripts/generate_r_reference.R"
+        )
+    return json.loads(path.read_text())
+
+
+def _build_df(
+    fixture: dict,
+) -> tuple[pd.DataFrame, list[int], list[int]]:
+    y = np.array(fixture["data"]["y"])
+    n_pre = fixture["n_pre"]
+    n = fixture["n"]
+
+    x_data = fixture["data"].get("x")
+    has_x = x_data and isinstance(x_data, dict) and len(x_data) > 0
+    if has_x:
+        cols = {"y": y}
+        for xname, xvals in x_data.items():
+            cols[xname] = np.array(xvals)
+        df = pd.DataFrame(cols)
+    else:
+        df = pd.DataFrame({"y": y})
+
+    pre_period = [0, n_pre - 1]
+    post_period = [n_pre, n - 1]
+    return df, pre_period, post_period
+
+
+def _run_causal_impact(fixture: dict) -> dict:
+    df, pre_period, post_period = _build_df(fixture)
+    ci = CausalImpact(
+        df, pre_period, post_period, model_args=MCMC_ARGS
+    )
+    return ci.summary_stats
+
+
+def _assert_relative(
+    py_val: float, r_val: float, tol: float, metric: str
+) -> None:
+    """相対誤差で比較。r_val ≈ 0 なら絶対誤差にフォールバック。"""
+    abs_threshold = 0.5
+    if abs(r_val) < abs_threshold:
+        abs_diff = abs(py_val - r_val)
+        assert abs_diff < abs_threshold, (
+            f"{metric}: abs diff {abs_diff:.6f} >= {abs_threshold}"
+            f" (py={py_val:.6f}, r={r_val:.6f})"
+        )
+    else:
+        rel_err = abs(py_val - r_val) / abs(r_val)
+        assert rel_err < tol, (
+            f"{metric}: rel err {rel_err:.4%} >= {tol:.0%}"
+            f" (py={py_val:.6f}, r={r_val:.6f})"
+        )
+
+
+def _assert_absolute(
+    py_val: float, r_val: float, tol: float, metric: str
+) -> None:
+    """絶対誤差で比較。true_effect=0 シナリオ用。"""
+    abs_diff = abs(py_val - r_val)
+    assert abs_diff < tol, (
+        f"{metric}: abs diff {abs_diff:.6f} >= {tol}"
+        f" (py={py_val:.6f}, r={r_val:.6f})"
+    )
+
+
+def _assert_significance(py_stats: dict, r_output: dict) -> None:
+    r_sig = r_output["p_value"] < 0.05
+    py_sig = py_stats["p_value"] < 0.05
+    r_label = "sig" if r_sig else "ns"
+    py_label = "sig" if py_sig else "ns"
+    assert r_sig == py_sig, (
+        f"Significance mismatch: "
+        f"R p={r_output['p_value']:.4f} ({r_label}), "
+        f"Py p={py_stats['p_value']:.4f} ({py_label})"
+    )
+
+
+# module-scope cache: run Gibbs once per scenario
+_cache: dict[str, tuple[dict, dict]] = {}
+
+
+def _get_scenario(scenario: str) -> tuple[dict, dict]:
+    if scenario not in _cache:
+        fixture = _load_fixture(scenario)
+        py_stats = _run_causal_impact(fixture)
+        _cache[scenario] = (fixture, py_stats)
+    return _cache[scenario]
+
+
+class TestEquivalenceBasic:
+    SCENARIO = "basic"
+
+    def test_point_effect_mean(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["point_effect_mean"],
+            r["point_effect_mean"],
+            TOL_POINT,
+            "point_effect_mean",
+        )
+
+    def test_ci_lower(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["ci_lower"], r["ci_lower"], TOL_CI, "ci_lower"
+        )
+
+    def test_ci_upper(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["ci_upper"], r["ci_upper"], TOL_CI, "ci_upper"
+        )
+
+    def test_cumulative_effect(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["cumulative_effect_total"],
+            r["cumulative_effect_total"],
+            TOL_POINT,
+            "cumulative_effect_total",
+        )
+
+    def test_p_value_significance(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        _assert_significance(py, fixture["r_output"])
+
+
+class TestEquivalenceCovariates:
+    SCENARIO = "covariates"
+
+    def test_point_effect_mean(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["point_effect_mean"],
+            r["point_effect_mean"],
+            TOL_POINT,
+            "point_effect_mean",
+        )
+
+    def test_ci_lower(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["ci_lower"], r["ci_lower"], TOL_CI, "ci_lower"
+        )
+
+    def test_ci_upper(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["ci_upper"], r["ci_upper"], TOL_CI, "ci_upper"
+        )
+
+    def test_cumulative_effect(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["cumulative_effect_total"],
+            r["cumulative_effect_total"],
+            TOL_POINT,
+            "cumulative_effect_total",
+        )
+
+    def test_p_value_significance(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        _assert_significance(py, fixture["r_output"])
+
+
+class TestEquivalenceStrongEffect:
+    SCENARIO = "strong_effect"
+
+    def test_point_effect_mean(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["point_effect_mean"],
+            r["point_effect_mean"],
+            TOL_POINT,
+            "point_effect_mean",
+        )
+
+    def test_ci_lower(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["ci_lower"], r["ci_lower"], TOL_CI, "ci_lower"
+        )
+
+    def test_ci_upper(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["ci_upper"], r["ci_upper"], TOL_CI, "ci_upper"
+        )
+
+    def test_cumulative_effect(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["cumulative_effect_total"],
+            r["cumulative_effect_total"],
+            TOL_POINT,
+            "cumulative_effect_total",
+        )
+
+    def test_p_value_significance(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        _assert_significance(py, fixture["r_output"])
+
+
+class TestEquivalenceNoEffect:
+    """no_effect: true_effect=0 のため絶対誤差で比較."""
+
+    SCENARIO = "no_effect"
+
+    def test_point_effect_mean(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_absolute(
+            py["point_effect_mean"],
+            r["point_effect_mean"],
+            ABS_TOL_NO_EFFECT,
+            "point_effect_mean",
+        )
+
+    def test_ci_lower(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_absolute(
+            py["ci_lower"],
+            r["ci_lower"],
+            ABS_TOL_NO_EFFECT,
+            "ci_lower",
+        )
+
+    def test_ci_upper(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_absolute(
+            py["ci_upper"],
+            r["ci_upper"],
+            ABS_TOL_NO_EFFECT,
+            "ci_upper",
+        )
+
+    def test_cumulative_effect(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_absolute(
+            py["cumulative_effect_total"],
+            r["cumulative_effect_total"],
+            ABS_TOL_NO_EFFECT,
+            "cumulative_effect_total",
+        )
+
+    def test_p_value_significance(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        _assert_significance(py, fixture["r_output"])
+
+
+class TestEquivalenceBoundary:
+    def test_fixture_missing_causes_skip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "tests.test_numerical_equivalence.FIXTURES_DIR",
+            tmp_path,
+        )
+        with pytest.raises(pytest.skip.Exception):
+            _load_fixture("nonexistent_scenario")
+
+    def test_tolerance_uses_absolute_when_r_val_near_zero(self):
+        _assert_relative(0.05, 0.0, 0.01, "near_zero")
+        _assert_relative(-0.05, 0.0, 0.01, "near_zero_neg")
+        with pytest.raises(AssertionError):
+            _assert_relative(0.6, 0.0, 0.01, "should_fail")

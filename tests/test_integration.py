@@ -69,63 +69,6 @@ class TestEndToEnd:
         assert ci.inferences is not None
 
 
-class TestRNumericalMatch:
-    """R CausalImpactとの数値互換性テスト.
-
-    NOTE: 完全なR reference dataはJSON化が必要。
-    ここでは統計的性質での検証を行う。
-    """
-
-    def test_r_numerical_match_point_estimate(self):
-        """点推定がR互換の範囲内(効果方向が正しい)."""
-        df, pre_period, post_period, true_effect = _make_causal_data(
-            n=100, true_effect=3.0, noise_sd=0.5, seed=42
-        )
-        ci = CausalImpact(
-            df, pre_period, post_period,
-            model_args={"niter": 1000, "nwarmup": 500, "seed": 42},
-        )
-        estimated = ci.summary_stats["point_effect_mean"]
-        # 効果の方向が一致し、大きさが妥当
-        assert estimated > 0, f"Effect should be positive, got {estimated}"
-        assert abs(estimated - true_effect) / true_effect < 0.5, (
-            f"Effect estimate {estimated:.2f} too far from true {true_effect}"
-        )
-
-    def test_r_numerical_match_ci_direction(self):
-        """CI方向がtrue effectを含む."""
-        df, pre_period, post_period, true_effect = _make_causal_data(
-            n=100, true_effect=3.0, noise_sd=0.5, seed=42
-        )
-        ci = CausalImpact(
-            df, pre_period, post_period,
-            model_args={"niter": 1000, "nwarmup": 500, "seed": 42},
-        )
-        stats = ci.summary_stats
-        assert stats["ci_lower"] > 0, "Lower CI should be positive for strong effect"
-
-    def test_r_numerical_match_significance(self):
-        """有意/非有意の判定が正しい."""
-        # Strong effect → significant
-        df, pre, post, _ = _make_causal_data(
-            n=100, true_effect=5.0, noise_sd=0.3, seed=42
-        )
-        ci = CausalImpact(
-            df, pre, post,
-            model_args={"niter": 1000, "nwarmup": 500, "seed": 42},
-        )
-        assert ci.summary_stats["p_value"] < 0.05
-
-        # No effect → not significant
-        df2, pre2, post2, _ = _make_causal_data(
-            n=100, true_effect=0.0, noise_sd=1.0, seed=99
-        )
-        ci2 = CausalImpact(
-            df2, pre2, post2,
-            model_args={"niter": 1000, "nwarmup": 500, "seed": 99},
-        )
-        assert ci2.summary_stats["p_value"] > 0.05
-
 
 class TestPerformance:
     """非機能テスト."""
