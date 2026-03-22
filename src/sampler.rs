@@ -1,12 +1,23 @@
 use crate::distributions::{sample_inv_gamma, sample_mvnormal, sample_normal};
 use crate::kalman::simulation_smoother;
-use crate::state_space::StateSpaceModel;
+use crate::state_space::{SeasonalConfig, StateSpaceModel};
 use rand::distributions::Bernoulli;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
 
 const SEED_PRIME: u64 = 6_364_136_223_846_793_005;
+const STATIC_REGRESSION_EXPECTED_R2: f64 = 0.8;
+const STATIC_REGRESSION_PRIOR_DF: f64 = 50.0;
+const STATIC_REGRESSION_PRIOR_INFORMATION_WEIGHT: f64 = 0.01;
+const STATIC_REGRESSION_DIAGONAL_SHRINKAGE: f64 = 0.5;
+
+struct StaticRegressionPrior {
+    beta_mean: Vec<f64>,
+    beta_precision: Vec<Vec<f64>>,
+    sigma_guess: f64,
+    prior_df: f64,
+}
 
 struct ChainResult {
     chain_id: usize,
@@ -38,6 +49,8 @@ pub fn run_sampler(
     seed: u64,
     prior_level_sd: f64,
     expected_model_size: f64,
+    nseasons: Option<f64>,
+    season_duration: Option<f64>,
 ) -> Result<GibbsResult, String> {
     validate_inputs(&y, pre_end, nchains)?;
 
@@ -46,7 +59,8 @@ pub fn run_sampler(
         return Err("expected_model_size must be > 0 when covariates are present".to_string());
     }
 
-    let model = StateSpaceModel::new(y.clone(), x);
+    let seasonal = SeasonalConfig::from_optional(nseasons, season_duration)?;
+    let model = StateSpaceModel::new(y.clone(), x, seasonal);
     let n_samples = niter * nchains;
     let chain_results: Vec<ChainResult> = (0..nchains)
         .into_par_iter()
@@ -105,12 +119,18 @@ fn run_single_chain(
 ) -> ChainResult {
     let t_total = y.len();
     let k = model.num_covariates();
+    let k_seasonal = model.num_seasonal_covariates();
     let y_sd = sample_standard_deviation(&y[..pre_end]);
+    let static_regression_prior =
+        (k > 0).then(|| build_static_regression_prior(model.covariates(), y_sd));
+    let seasonal_regression_prior =
+        (k_seasonal > 0).then(|| build_static_regression_prior(model.seasonal_covariates(), y_sd));
     let chain_seed = seed ^ (chain_id as u64).wrapping_mul(SEED_PRIME);
     let mut rng = StdRng::seed_from_u64(chain_seed);
     let mut sigma2_obs = 1.0;
     let mut sigma2_level = (prior_level_sd * prior_level_sd).max(1e-6);
     let mut beta = vec![0.0; k];
+    let mut seasonal_beta = vec![0.0; k_seasonal];
     let mut gamma = vec![true; k];
     let mut chain_result = ChainResult {
         chain_id,
@@ -138,7 +158,7 @@ fn run_single_chain(
 
     for iter in 0..(niter + nwarmup) {
         // Step 1: State sampling (simulation smoother)
-        let y_adj = adjusted_observations(y, model, &beta, pre_end);
+        let y_adj = adjusted_observations(y, model, &beta, &seasonal_beta, pre_end);
         let states = simulation_smoother(
             &mut rng,
             &y_adj,
@@ -155,20 +175,18 @@ fn run_single_chain(
         // - blocked g-prior (pi>=1.0): sample beta BEFORE sigma2_obs
         //   (original ordering, preserves backward compatibility)
         if k > 0 && use_spike_slab {
-            sigma2_obs =
-                sample_sigma2_obs(&mut rng, &y[..pre_end], &states, &beta, model.covariates());
+            sigma2_obs = sample_sigma2_obs(
+                &mut rng,
+                &y[..pre_end],
+                &states,
+                model,
+                &beta,
+                &seasonal_beta,
+                y_sd,
+                0.01,
+            );
 
-            let mut residual: Vec<f64> = y[..pre_end]
-                .iter()
-                .zip(states.iter())
-                .map(|(y_val, s)| y_val - s)
-                .collect();
-            for j in 0..k {
-                let x_col = &model.covariates()[j];
-                for (t, r) in residual.iter_mut().enumerate().take(pre_end) {
-                    *r -= x_col[t] * beta[j];
-                }
-            }
+            let mut residual = user_residual(&y[..pre_end], &states, model, &beta, &seasonal_beta);
 
             sample_spike_and_slab(
                 &mut rng,
@@ -182,23 +200,99 @@ fn run_single_chain(
                 g,
                 log_prior_odds,
             );
-        } else if k > 0 {
-            // pi >= 1.0: all variables always included (backward compatible)
-            beta = sample_beta(
+            if k_seasonal > 0 {
+                let prior = seasonal_regression_prior
+                    .as_ref()
+                    .expect("seasonal regression prior must exist when seasonal regressors exist");
+                let baseline = baseline_from_state_and_block(&states, model.covariates(), &beta);
+                seasonal_beta = sample_beta_with_normal_prior(
+                    &mut rng,
+                    &y[..pre_end],
+                    &baseline,
+                    model.seasonal_covariates(),
+                    sigma2_obs,
+                    &prior.beta_mean,
+                    &prior.beta_precision,
+                );
+            }
+        } else if k > 0 || k_seasonal > 0 {
+            if k > 0 {
+                let prior = static_regression_prior
+                    .as_ref()
+                    .expect("static regression prior must exist when k > 0");
+                let baseline = baseline_from_state_and_block(
+                    &states,
+                    model.seasonal_covariates(),
+                    &seasonal_beta,
+                );
+                beta = sample_beta_with_normal_prior(
+                    &mut rng,
+                    &y[..pre_end],
+                    &baseline,
+                    model.covariates(),
+                    sigma2_obs,
+                    &prior.beta_mean,
+                    &prior.beta_precision,
+                );
+                for gj in gamma.iter_mut() {
+                    *gj = true;
+                }
+            }
+            if k_seasonal > 0 {
+                let prior = seasonal_regression_prior
+                    .as_ref()
+                    .expect("seasonal regression prior must exist when seasonal regressors exist");
+                let baseline = baseline_from_state_and_block(&states, model.covariates(), &beta);
+                seasonal_beta = sample_beta_with_normal_prior(
+                    &mut rng,
+                    &y[..pre_end],
+                    &baseline,
+                    model.seasonal_covariates(),
+                    sigma2_obs,
+                    &prior.beta_mean,
+                    &prior.beta_precision,
+                );
+            }
+            let sigma_guess = static_regression_prior
+                .as_ref()
+                .map(|prior| prior.sigma_guess)
+                .or_else(|| {
+                    seasonal_regression_prior
+                        .as_ref()
+                        .map(|prior| prior.sigma_guess)
+                })
+                .unwrap_or(y_sd);
+            let prior_df = static_regression_prior
+                .as_ref()
+                .map(|prior| prior.prior_df)
+                .or_else(|| {
+                    seasonal_regression_prior
+                        .as_ref()
+                        .map(|prior| prior.prior_df)
+                })
+                .unwrap_or(0.01);
+            sigma2_obs = sample_sigma2_obs(
                 &mut rng,
                 &y[..pre_end],
                 &states,
-                model.covariates(),
-                sigma2_obs,
+                model,
+                &beta,
+                &seasonal_beta,
+                sigma_guess,
+                prior_df,
             );
-            for gj in gamma.iter_mut() {
-                *gj = true;
-            }
-            sigma2_obs =
-                sample_sigma2_obs(&mut rng, &y[..pre_end], &states, &beta, model.covariates());
         } else {
-            sigma2_obs =
-                sample_sigma2_obs(&mut rng, &y[..pre_end], &states, &beta, model.covariates());
+            let sigma_guess = sample_standard_deviation(&y[..pre_end]);
+            sigma2_obs = sample_sigma2_obs(
+                &mut rng,
+                &y[..pre_end],
+                &states,
+                model,
+                &beta,
+                &seasonal_beta,
+                sigma_guess,
+                0.01,
+            );
         }
 
         // Step 4: sigma^2_level sampling
@@ -212,8 +306,15 @@ fn run_single_chain(
                 sigma2_level,
             );
             let full_states = combine_state_paths(&states, &states_post);
-            let predictions =
-                generate_predictions(&states_post, &beta, model, pre_end, sigma2_obs, &mut rng);
+            let predictions = generate_predictions(
+                &states_post,
+                &beta,
+                &seasonal_beta,
+                model,
+                pre_end,
+                sigma2_obs,
+                &mut rng,
+            );
 
             chain_result.states.push(full_states);
             chain_result.sigma_obs.push(sigma2_obs.sqrt());
@@ -257,46 +358,64 @@ fn adjusted_observations(
     y: &[f64],
     model: &StateSpaceModel,
     beta: &[f64],
+    seasonal_beta: &[f64],
     pre_end: usize,
 ) -> Vec<f64> {
     y.iter()
         .take(pre_end)
         .enumerate()
-        .map(|(t, y_value)| {
-            y_value
-                - beta
-                    .iter()
-                    .enumerate()
-                    .map(|(j, beta_value)| model.x_at(j, t) * beta_value)
-                    .sum::<f64>()
+        .map(|(t, y_value)| y_value - model.regression_contribution(t, beta, seasonal_beta))
+        .collect()
+}
+
+fn baseline_from_state_and_block(states: &[f64], x: &[Vec<f64>], beta: &[f64]) -> Vec<f64> {
+    states
+        .iter()
+        .enumerate()
+        .map(|(t, state)| state + block_contribution(x, beta, t))
+        .collect()
+}
+
+fn user_residual(
+    y_pre: &[f64],
+    states: &[f64],
+    model: &StateSpaceModel,
+    beta: &[f64],
+    seasonal_beta: &[f64],
+) -> Vec<f64> {
+    y_pre
+        .iter()
+        .zip(states.iter())
+        .enumerate()
+        .map(|(t, (y_value, state))| {
+            y_value - state - model.regression_contribution(t, beta, seasonal_beta)
         })
         .collect()
 }
 
-fn sample_beta<R: rand::Rng>(
+fn block_contribution(x: &[Vec<f64>], beta: &[f64], t: usize) -> f64 {
+    x.iter()
+        .zip(beta.iter())
+        .map(|(x_col, beta_value)| x_col[t] * beta_value)
+        .sum::<f64>()
+}
+
+fn sample_beta_with_normal_prior<R: rand::Rng>(
     rng: &mut R,
     y_pre: &[f64],
-    states: &[f64],
+    baseline: &[f64],
     x: &[Vec<f64>],
     sigma2_obs: f64,
+    prior_mean: &[f64],
+    prior_precision: &[Vec<f64>],
 ) -> Vec<f64> {
     let k = x.len();
-    let mut xtx = vec![vec![0.0; k]; k];
-    for (i, row) in xtx.iter_mut().enumerate() {
-        for (j, value) in row.iter_mut().enumerate() {
-            *value = x[i]
-                .iter()
-                .zip(x[j].iter())
-                .take(y_pre.len())
-                .map(|(lhs, rhs)| lhs * rhs)
-                .sum();
-        }
-    }
+    let xtx = cross_product_matrix(x, y_pre.len());
 
     let residuals: Vec<f64> = y_pre
         .iter()
-        .zip(states.iter())
-        .map(|(y_value, state)| y_value - state)
+        .zip(baseline.iter())
+        .map(|(y_value, baseline_value)| y_value - baseline_value)
         .collect();
 
     let mut xtr = vec![0.0; k];
@@ -304,30 +423,28 @@ fn sample_beta<R: rand::Rng>(
         xtr[j] = x_col
             .iter()
             .zip(residuals.iter())
+            .take(y_pre.len())
             .map(|(x_value, residual)| x_value * residual)
             .sum();
     }
 
-    let g = y_pre.len() as f64;
-    let scale = (1.0 + 1.0 / g) / sigma2_obs;
-    let mut precision = vec![vec![0.0; k]; k];
-    for (i, row) in precision.iter_mut().enumerate() {
+    let mut posterior_precision = xtx;
+    for (i, row) in posterior_precision.iter_mut().enumerate() {
         for (j, value) in row.iter_mut().enumerate() {
-            *value = xtx[i][j] * scale;
+            *value += prior_precision[i][j];
         }
     }
 
-    let covariance = invert_matrix(&precision);
-    let mut mean = vec![0.0; k];
-    for (i, mean_value) in mean.iter_mut().enumerate() {
-        *mean_value = covariance[i]
-            .iter()
-            .zip(xtr.iter())
-            .map(|(covariance_value, xtr_value)| covariance_value * xtr_value / sigma2_obs)
-            .sum();
+    let mut rhs = xtr;
+    let prior_precision_times_mean = matrix_vector_product(prior_precision, prior_mean);
+    for (value, prior_value) in rhs.iter_mut().zip(prior_precision_times_mean.iter()) {
+        *value += prior_value;
     }
 
-    sample_mvnormal(rng, &mean, &covariance)
+    let posterior_precision_inverse = invert_matrix(&posterior_precision);
+    let posterior_mean = matrix_vector_product(&posterior_precision_inverse, &rhs);
+    let posterior_covariance = scale_matrix(&posterior_precision_inverse, sigma2_obs);
+    sample_mvnormal(rng, &posterior_mean, &posterior_covariance)
 }
 
 /// Coordinate-wise spike-and-slab sampling for (gamma, beta).
@@ -431,16 +548,18 @@ fn sample_spike_and_slab<R: rand::Rng>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_sigma2_obs<R: rand::Rng>(
     rng: &mut R,
     y_pre: &[f64],
     states: &[f64],
+    model: &StateSpaceModel,
     beta: &[f64],
-    x: &[Vec<f64>],
+    seasonal_beta: &[f64],
+    sigma_guess: f64,
+    prior_df: f64,
 ) -> f64 {
-    let sigma_guess = sample_standard_deviation(y_pre);
-    let sample_size = 0.01;
-    let a_prior = sample_size / 2.0;
+    let a_prior = prior_df / 2.0;
     let b_prior = a_prior * sigma_guess * sigma_guess;
 
     let sse = y_pre
@@ -448,11 +567,7 @@ fn sample_sigma2_obs<R: rand::Rng>(
         .zip(states.iter())
         .enumerate()
         .map(|(t, (y_value, state))| {
-            let fitted = state
-                + x.iter()
-                    .zip(beta.iter())
-                    .map(|(x_col, beta_value)| x_col[t] * beta_value)
-                    .sum::<f64>();
+            let fitted = state + model.regression_contribution(t, beta, seasonal_beta);
             let error = y_value - fitted;
             error * error
         })
@@ -461,6 +576,29 @@ fn sample_sigma2_obs<R: rand::Rng>(
     let shape = a_prior + y_pre.len() as f64 / 2.0;
     let scale = b_prior + sse / 2.0;
     sample_inv_gamma(rng, shape, scale).max(1e-12)
+}
+
+fn build_static_regression_prior(x: &[Vec<f64>], y_sd: f64) -> StaticRegressionPrior {
+    let normalized_xtx = normalized_cross_product_matrix(x);
+    let diagonal_xtx = diagonal_matrix(&normalized_xtx);
+    let mut beta_precision = vec![vec![0.0; x.len()]; x.len()];
+
+    for (i, row) in beta_precision.iter_mut().enumerate() {
+        for (j, value) in row.iter_mut().enumerate() {
+            let diagonal_component = diagonal_xtx[i][j];
+            let dense_component = normalized_xtx[i][j];
+            *value = STATIC_REGRESSION_PRIOR_INFORMATION_WEIGHT
+                * (STATIC_REGRESSION_DIAGONAL_SHRINKAGE * diagonal_component
+                    + (1.0 - STATIC_REGRESSION_DIAGONAL_SHRINKAGE) * dense_component);
+        }
+    }
+
+    StaticRegressionPrior {
+        beta_mean: vec![0.0; x.len()],
+        beta_precision,
+        sigma_guess: (1.0 - STATIC_REGRESSION_EXPECTED_R2).sqrt() * y_sd,
+        prior_df: STATIC_REGRESSION_PRIOR_DF,
+    }
 }
 
 fn sample_sigma2_level<R: rand::Rng>(
@@ -509,6 +647,61 @@ fn sample_standard_deviation(values: &[f64]) -> f64 {
     }
 }
 
+fn cross_product_matrix(x: &[Vec<f64>], t: usize) -> Vec<Vec<f64>> {
+    let k = x.len();
+    let mut xtx = vec![vec![0.0; k]; k];
+    for (i, row) in xtx.iter_mut().enumerate() {
+        for (j, value) in row.iter_mut().enumerate() {
+            *value = x[i]
+                .iter()
+                .zip(x[j].iter())
+                .take(t)
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum();
+        }
+    }
+    xtx
+}
+
+fn normalized_cross_product_matrix(x: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = x.first().map_or(1, Vec::len) as f64;
+    let mut xtx = cross_product_matrix(x, x.first().map_or(0, Vec::len));
+    for row in &mut xtx {
+        for value in row {
+            *value /= n;
+        }
+    }
+    xtx
+}
+
+fn diagonal_matrix(matrix: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let k = matrix.len();
+    let mut diagonal = vec![vec![0.0; k]; k];
+    for (i, row) in diagonal.iter_mut().enumerate() {
+        row[i] = matrix[i][i];
+    }
+    diagonal
+}
+
+fn matrix_vector_product(matrix: &[Vec<f64>], vector: &[f64]) -> Vec<f64> {
+    matrix
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(vector.iter())
+                .map(|(lhs, rhs)| lhs * rhs)
+                .sum()
+        })
+        .collect()
+}
+
+fn scale_matrix(matrix: &[Vec<f64>], scalar: f64) -> Vec<Vec<f64>> {
+    matrix
+        .iter()
+        .map(|row| row.iter().map(|value| value * scalar).collect())
+        .collect()
+}
+
 fn sample_post_period_states<R: rand::Rng>(
     rng: &mut R,
     last_pre_state: f64,
@@ -534,6 +727,7 @@ fn combine_state_paths(states_pre: &[f64], states_post: &[f64]) -> Vec<f64> {
 fn generate_predictions<R: rand::Rng>(
     states_post: &[f64],
     beta: &[f64],
+    seasonal_beta: &[f64],
     model: &StateSpaceModel,
     pre_end: usize,
     sigma2_obs: f64,
@@ -544,7 +738,7 @@ fn generate_predictions<R: rand::Rng>(
         .enumerate()
         .map(|(offset, state)| {
             let t = pre_end + offset;
-            model.observe(t, *state, beta) + sample_normal(rng, 0.0, sigma2_obs)
+            model.observe(t, *state, beta, seasonal_beta) + sample_normal(rng, 0.0, sigma2_obs)
         })
         .collect()
 }
@@ -631,7 +825,7 @@ mod tests {
     #[test]
     fn test_run_sampler_basic() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
-        let result = run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0).unwrap();
+        let result = run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0, None, None).unwrap();
         assert_eq!(result.states.len(), 10);
         assert_eq!(result.sigma_obs.len(), 10);
         assert_eq!(result.predictions.len(), 10);
@@ -643,7 +837,7 @@ mod tests {
     fn test_run_sampler_with_covariates() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
-        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0).unwrap();
+        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0, None, None).unwrap();
         assert_eq!(result.beta.len(), 10);
         assert_eq!(result.beta[0].len(), 1);
         assert_eq!(result.gamma.len(), 10);
@@ -652,14 +846,14 @@ mod tests {
 
     #[test]
     fn test_run_sampler_empty_y() {
-        let result = run_sampler(vec![], vec![], 0, 10, 5, 1, 42, 0.01, 1.0);
+        let result = run_sampler(vec![], vec![], 0, 10, 5, 1, 42, 0.01, 1.0, None, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_run_sampler_pre_end_equals_t() {
         let y: Vec<f64> = vec![1.0, 2.0, 3.0];
-        let result = run_sampler(y, vec![], 3, 10, 5, 1, 42, 0.01, 1.0);
+        let result = run_sampler(y, vec![], 3, 10, 5, 1, 42, 0.01, 1.0, None, None);
         assert!(result.is_err());
     }
 
@@ -668,10 +862,22 @@ mod tests {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
         // k>0 with expected_model_size=0 should fail
-        let result = run_sampler(y.clone(), vec![x1.clone()], 15, 10, 5, 1, 42, 0.01, 0.0);
+        let result = run_sampler(
+            y.clone(),
+            vec![x1.clone()],
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            0.0,
+            None,
+            None,
+        );
         assert!(result.is_err());
         // k>0 with negative should fail
-        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, -1.0);
+        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, -1.0, None, None);
         assert!(result.is_err());
     }
 
@@ -693,6 +899,25 @@ mod tests {
             .map(|state| (state * 1_000_000_000.0).round() as i64)
             .collect();
         assert!(rounded_unique_states.len() > 1);
+    }
+
+    #[test]
+    fn test_build_static_regression_prior_matches_r_spike_slab_formula() {
+        let x = vec![vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 1.0, 0.0, -1.0]];
+        let prior = build_static_regression_prior(&x, 1.0);
+
+        assert!((prior.sigma_guess - (1.0 - 0.8_f64).sqrt()).abs() < 1e-12);
+        assert!((prior.prior_df - 50.0).abs() < 1e-12);
+
+        let normalized_xtx = normalized_cross_product_matrix(&x);
+        let expected_00 = 0.01 * normalized_xtx[0][0];
+        let expected_11 = 0.01 * normalized_xtx[1][1];
+        let expected_01 = 0.005 * normalized_xtx[0][1];
+
+        assert!((prior.beta_precision[0][0] - expected_00).abs() < 1e-12);
+        assert!((prior.beta_precision[1][1] - expected_11).abs() < 1e-12);
+        assert!((prior.beta_precision[0][1] - expected_01).abs() < 1e-12);
+        assert!((prior.beta_precision[1][0] - expected_01).abs() < 1e-12);
     }
 
     #[test]

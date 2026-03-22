@@ -12,8 +12,8 @@
     - no-covariates     ±1.5%  相対誤差
       niter=50000での収束値 ~0.83%、MCMC分散 ±0.5% を考慮した閾値。
       prior修正 (SdPrior sample.size=32) + post-period Random Walk 伝播による。
-    - covariates        ±10% 相対誤差
-      spike-and-slab parity 完了まで Phase 2 扱い
+    - covariates        ±1% 相対誤差
+      static regression prior を R SpikeSlabPrior に合わせた閾値。
     - Google R source の summary CI 定義とは整合済み
   p_value               有意性分類一致 (α=0.05)
 
@@ -46,7 +46,10 @@ TOL_POINT = 0.03  # ±3% for point estimates
 # ±1.5% for no-covariates CI bounds
 # (convergence ~0.83%, MCMC variance ±0.5%)
 TOL_CI_NO_COV = 0.015
-TOL_CI_COV = 0.10  # ±10% until Phase 2 spike-and-slab parity
+TOL_CI_COV = 0.01  # ±1% after aligning with the R static regression prior
+TOL_CI_PHASE2 = 0.03  # explicit Phase 2 benchmark for covariate CI bounds
+TOL_POINT_SEASONAL = 0.05
+TOL_CI_SEASONAL = 0.05
 ABS_TOL_NO_EFFECT = 2.0  # absolute tolerance when true_effect=0
 
 
@@ -85,7 +88,14 @@ def _build_df(
 
 def _run_causal_impact(fixture: dict) -> dict:
     df, pre_period, post_period = _build_df(fixture)
-    ci = CausalImpact(df, pre_period, post_period, model_args=MCMC_ARGS)
+    model_args = {**MCMC_ARGS}
+    model_args.update(
+        {
+            key.replace(".", "_"): value
+            for key, value in fixture.get("model_args", {}).items()
+        }
+    )
+    ci = CausalImpact(df, pre_period, post_period, model_args=model_args)
     return ci.summary_stats
 
 
@@ -179,12 +189,6 @@ class TestEquivalenceBasic:
 class TestEquivalenceCovariates:
     SCENARIO = "covariates"
 
-    @pytest.mark.xfail(
-        reason=(
-            "Phase 2: spike-and-slab parity is still required "
-            "for covariate point estimates"
-        ),
-    )
     def test_point_effect_mean(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
@@ -205,12 +209,6 @@ class TestEquivalenceCovariates:
         r = fixture["r_output"]
         _assert_relative(py["ci_upper"], r["ci_upper"], TOL_CI_COV, "ci_upper")
 
-    @pytest.mark.xfail(
-        reason=(
-            "Phase 2: spike-and-slab parity is still required "
-            "for covariate cumulative effects"
-        ),
-    )
     def test_cumulative_effect(self):
         fixture, py = _get_scenario(self.SCENARIO)
         r = fixture["r_output"]
@@ -256,6 +254,82 @@ class TestEquivalenceStrongEffect:
             py["cumulative_effect_total"],
             r["cumulative_effect_total"],
             TOL_POINT,
+            "cumulative_effect_total",
+        )
+
+    def test_p_value_significance(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        _assert_significance(py, fixture["r_output"])
+
+
+class TestEquivalenceCovariatesPhase2:
+    SCENARIO = "covariates"
+
+    def test_point_effect_mean(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["point_effect_mean"],
+            r["point_effect_mean"],
+            TOL_POINT,
+            "point_effect_mean",
+        )
+
+    def test_ci_lower(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(py["ci_lower"], r["ci_lower"], TOL_CI_PHASE2, "ci_lower")
+
+    def test_ci_upper(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(py["ci_upper"], r["ci_upper"], TOL_CI_PHASE2, "ci_upper")
+
+    def test_cumulative_effect(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["cumulative_effect_total"],
+            r["cumulative_effect_total"],
+            TOL_POINT,
+            "cumulative_effect_total",
+        )
+
+    def test_p_value_significance(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        _assert_significance(py, fixture["r_output"])
+
+
+class TestEquivalenceSeasonal:
+    SCENARIO = "seasonal"
+
+    def test_point_effect_mean(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["point_effect_mean"],
+            r["point_effect_mean"],
+            TOL_POINT_SEASONAL,
+            "point_effect_mean",
+        )
+
+    def test_ci_lower(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(py["ci_lower"], r["ci_lower"], TOL_CI_SEASONAL, "ci_lower")
+
+    def test_ci_upper(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(py["ci_upper"], r["ci_upper"], TOL_CI_SEASONAL, "ci_upper")
+
+    def test_cumulative_effect(self):
+        fixture, py = _get_scenario(self.SCENARIO)
+        r = fixture["r_output"]
+        _assert_relative(
+            py["cumulative_effect_total"],
+            r["cumulative_effect_total"],
+            TOL_POINT_SEASONAL,
             "cumulative_effect_total",
         )
 

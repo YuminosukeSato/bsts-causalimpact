@@ -7,9 +7,7 @@ import pandas as pd
 from causal_impact import CausalImpact
 
 
-def _make_causal_data(
-    n=100, pre_frac=0.7, true_effect=3.0, noise_sd=0.5, seed=42
-):
+def _make_causal_data(n=100, pre_frac=0.7, true_effect=3.0, noise_sd=0.5, seed=42):
     """Generate synthetic data with a known causal effect."""
     rng = np.random.default_rng(seed)
     pre_end = int(n * pre_frac)
@@ -79,6 +77,72 @@ class TestEndToEnd:
         assert ci.summary() is not None
         assert ci.inferences is not None
 
+    def test_seasonal_model_tracks_weekly_pattern_that_local_level_misses(self):
+        rng = np.random.default_rng(123)
+        n = 84
+        pre_end = 56
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        seasonal_pattern = np.array([0.0, 1.0, 2.0, 1.0, 0.0, -1.0, -2.0])
+        repeated = np.resize(seasonal_pattern, n)
+        y = 20.0 + repeated + rng.normal(0.0, 0.05, n)
+        y[pre_end:] += 3.0
+        df = pd.DataFrame({"y": y}, index=dates)
+        pre_period = [str(dates[0].date()), str(dates[pre_end - 1].date())]
+        post_period = [str(dates[pre_end].date()), str(dates[-1].date())]
+
+        ci_without_seasonal = CausalImpact(
+            df,
+            pre_period,
+            post_period,
+            model_args={"niter": 300, "nwarmup": 150, "seed": 123},
+        )
+        ci_with_seasonal = CausalImpact(
+            df,
+            pre_period,
+            post_period,
+            model_args={
+                "niter": 300,
+                "nwarmup": 150,
+                "seed": 123,
+                "nseasons": 7,
+                "season_duration": 1,
+            },
+        )
+
+        no_seasonal_error = abs(
+            ci_without_seasonal.summary_stats["point_effect_mean"] - 3.0
+        )
+        seasonal_error = abs(ci_with_seasonal.summary_stats["point_effect_mean"] - 3.0)
+
+        assert seasonal_error < no_seasonal_error
+
+    def test_season_duration_two_keeps_two_day_blocks_together(self):
+        rng = np.random.default_rng(321)
+        n = 84
+        pre_end = 56
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        block_pattern = np.repeat(np.array([0.0, 1.0, 2.0, 1.0, -1.0, -2.0, -1.0]), 2)
+        repeated = np.resize(block_pattern, n)
+        y = 50.0 + repeated + rng.normal(0.0, 0.05, n)
+        y[pre_end:] += 4.0
+        df = pd.DataFrame({"y": y}, index=dates)
+        pre_period = [str(dates[0].date()), str(dates[pre_end - 1].date())]
+        post_period = [str(dates[pre_end].date()), str(dates[-1].date())]
+
+        ci = CausalImpact(
+            df,
+            pre_period,
+            post_period,
+            model_args={
+                "niter": 300,
+                "nwarmup": 150,
+                "seed": 321,
+                "nseasons": 7,
+                "season_duration": 2,
+            },
+        )
+
+        assert abs(ci.summary_stats["point_effect_mean"] - 4.0) < 1.0
 
 
 class TestSpikeSlabIntegration:
@@ -99,19 +163,25 @@ class TestSpikeSlabIntegration:
 
         pre_period = [str(dates[0].date()), str(dates[pre_end - 1].date())]
         post_period = [str(dates[pre_end].date()), str(dates[-1].date())]
-        model_args = {"niter": 1000, "nwarmup": 500, "seed": 42,
-                       "expected_model_size": 1}
+        model_args = {
+            "niter": 1000,
+            "nwarmup": 500,
+            "seed": 42,
+            "expected_model_size": 1,
+        }
 
         df_multi = pd.DataFrame(
             {"y": y, "x1": x_signal, "x2": x_noise1, "x3": x_noise2},
             index=dates,
         )
-        ci_multi = CausalImpact(df_multi, pre_period, post_period,
-                                 model_args=model_args)
+        ci_multi = CausalImpact(
+            df_multi, pre_period, post_period, model_args=model_args
+        )
 
         df_single = pd.DataFrame({"y": y, "x1": x_signal}, index=dates)
-        ci_single = CausalImpact(df_single, pre_period, post_period,
-                                  model_args=model_args)
+        ci_single = CausalImpact(
+            df_single, pre_period, post_period, model_args=model_args
+        )
 
         effect_multi = ci_multi.summary_stats["point_effect_mean"]
         effect_single = ci_single.summary_stats["point_effect_mean"]

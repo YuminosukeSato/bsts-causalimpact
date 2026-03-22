@@ -143,6 +143,38 @@ class TestExpectedModelSizeBoundary:
 
 
 # ---------------------------------------------------------------------------
+# Boundary: seasonal options
+# ---------------------------------------------------------------------------
+
+
+class TestSeasonalOptionsBoundary:
+    def test_nseasons_without_season_duration_defaults_to_1(self):
+        opts = ModelOptions(nseasons=7)
+        assert opts.nseasons == 7
+        assert opts.season_duration == 1
+
+    def test_season_duration_without_nseasons_raises(self):
+        with pytest.raises(ValueError, match="nseasons"):
+            ModelOptions(season_duration=2)
+
+    def test_nseasons_zero_raises(self):
+        with pytest.raises(ValueError, match="nseasons"):
+            ModelOptions(nseasons=0)
+
+    def test_nseasons_non_integer_raises(self):
+        with pytest.raises(ValueError, match="nseasons"):
+            ModelOptions(nseasons=7.5)  # type: ignore[arg-type]
+
+    def test_season_duration_zero_raises(self):
+        with pytest.raises(ValueError, match="season_duration"):
+            ModelOptions(nseasons=7, season_duration=0)
+
+    def test_season_duration_non_integer_raises(self):
+        with pytest.raises(ValueError, match="season_duration"):
+            ModelOptions(nseasons=7, season_duration=1.5)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
 # Immutability (frozen dataclass)
 # ---------------------------------------------------------------------------
 
@@ -181,6 +213,8 @@ class TestToDict:
             "standardize_data",
             "prior_level_sd",
             "expected_model_size",
+            "nseasons",
+            "season_duration",
         }
         assert set(d.keys()) == expected_keys
 
@@ -240,10 +274,24 @@ class TestBackwardCompatibility:
         params = {"niter": 200, "nwarmup": 100, "seed": 42}
 
         ci_dict = CausalImpact(df, pre, post, model_args=params)
-        ci_opts = CausalImpact(
-            df, pre, post, model_args=ModelOptions(**params)
-        )
+        ci_opts = CausalImpact(df, pre, post, model_args=ModelOptions(**params))
 
         assert ci_dict.summary_stats["point_effect_mean"] == pytest.approx(
             ci_opts.summary_stats["point_effect_mean"], rel=1e-10
         )
+
+    def test_model_args_accepts_r_style_season_duration_alias(self):
+        df, pre, post = _make_test_data()
+        ci = CausalImpact(
+            df,
+            pre,
+            post,
+            model_args={
+                "niter": 100,
+                "nwarmup": 50,
+                "seed": 1,
+                "nseasons": 7,
+                "season.duration": 1,
+            },
+        )
+        assert ci.summary() is not None

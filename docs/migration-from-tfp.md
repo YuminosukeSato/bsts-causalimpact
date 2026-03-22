@@ -74,7 +74,16 @@ ci = CausalImpact(data, pre_period, post_period, model_args=opts)
 ci = CausalImpact(data, pre_period, post_period, model_args={"niter": 1000})
 ```
 
-Note: `bsts-causalimpact` does not support seasonal components (`nseasons`) in the current version. If your analysis requires seasonality, you need to handle it via covariates (e.g., Fourier terms).
+`bsts-causalimpact` supports `nseasons` and `season_duration` directly:
+
+```python
+ci = CausalImpact(
+    data,
+    pre_period,
+    post_period,
+    model_args={"nseasons": 7, "season_duration": 1},
+)
+```
 
 ### Output Access
 
@@ -88,7 +97,6 @@ Note: `bsts-causalimpact` does not support seasonal components (`nseasons`) in t
 
 ### What Is Not Supported
 
-- Seasonal state components
 - Custom prior specification beyond `prior_level_sd`
 - TensorFlow-based model customization
 

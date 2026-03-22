@@ -39,11 +39,11 @@ fig = ci.plot()
 | R (model.args) | Python (model_args / ModelOptions) | Default |
 |---|---|---|
 | `niter` | `niter` | 1000 |
-| `nseasons` | Not supported | - |
-| `season.duration` | Not supported | - |
+| `nseasons` | `nseasons` | `None` |
+| `season.duration` | `season_duration` or `model_args["season.duration"]` | `1` when `nseasons` is set |
 | `prior.level.sd` | `prior_level_sd` | 0.01 |
 | `standardize.data` | `standardize_data` | True |
-| `expected.model.size` | `expected_model_size` | 1 |
+| `expected.model.size` | `expected_model_size` | 2 in `CausalImpact`; `ModelOptions` keeps 1 |
 
 ## Data Format
 
@@ -81,13 +81,12 @@ Key differences:
 
 ## Numerical Equivalence
 
-This library verifies ±3% agreement with R CausalImpact on point estimates and cumulative effects across multiple test scenarios. Tests run on every PR.
+This library verifies ±3% agreement with R CausalImpact on point estimates and cumulative effects across multiple test scenarios, including a seasonal fixture. Tests run on every PR.
 
 Differences arise from independent RNG implementations (R's `set.seed` vs Rust's `ChaCha8Rng`), not from algorithmic differences.
 
 ## What Is Not Supported
 
-- Seasonal state components (`nseasons`, `season.duration`)
 - Custom bsts model objects
 - `model.args$dynamic.regression`
 

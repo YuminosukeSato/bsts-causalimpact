@@ -8,7 +8,7 @@ Comparison of features between R CausalImpact (bsts 1.4.1) and this Python imple
 |---|---|---|---|
 | Local level | Yes | Yes | Identical algorithm |
 | Local linear trend | Yes | No | Not yet implemented |
-| Seasonality | Yes | No | Use Fourier covariates as workaround |
+| Seasonality | Yes | Yes | R-compatible API with seasonal fixture coverage |
 | Dynamic regression | Yes | No | Not yet implemented |
 | Regression (static) | Yes | Yes | Identical algorithm |
 
@@ -17,11 +17,11 @@ Comparison of features between R CausalImpact (bsts 1.4.1) and this Python imple
 | Parameter | R | Python | Notes |
 |---|---|---|---|
 | niter | Yes | Yes | Same default (1000) |
-| nseasons | Yes | No | - |
-| season.duration | Yes | No | - |
+| nseasons | Yes | Yes | `ModelOptions.nseasons` or `model_args["nseasons"]` |
+| season.duration | Yes | Yes | `ModelOptions.season_duration` or `model_args["season.duration"]` |
 | prior.level.sd | Yes | Yes | Same default (0.01) |
 | standardize.data | Yes | Yes | Same default (True) |
-| expected.model.size | Yes | Yes | Same default (1) |
+| expected.model.size | Yes | Yes | Legacy `CausalImpact` default is 2; `ModelOptions` keeps 1 |
 
 ## Warmup Semantics
 
@@ -70,7 +70,7 @@ Comparison of features between R CausalImpact (bsts 1.4.1) and this Python imple
 |---|---|---|
 | point_effect_mean | ±3% relative | Passing |
 | cumulative_effect_total | ±3% relative | Passing |
-| ci_lower / ci_upper | ±15% relative | Passing |
+| ci_lower / ci_upper | Tight parity (`±1.5%` no-cov, `±1%` covariates, `±5%` seasonal) | Passing |
 | p_value significance | Match at alpha=0.05 | Passing |
 
 Tests run against R CausalImpact 1.4.1 fixtures on every PR.

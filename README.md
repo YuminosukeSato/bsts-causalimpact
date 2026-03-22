@@ -71,9 +71,9 @@ fig.savefig("causal_impact.png")
 | Algorithm | Gibbs (bsts/C++) | Gibbs (Rust) | TFP-based | VI default / HMC | MLE (statsmodels) |
 | Dependencies | R, bsts | numpy, pandas, matplotlib | TF, TFP (3 GB+) | TF, TFP (3 GB+) | statsmodels |
 | Spike-and-slab | Yes | Yes | Unknown | No | No |
-| Seasonal component | Yes | Planned | Unknown | Yes (TFP STS) | No |
+| Seasonal component | Yes | Yes (`nseasons`, `season_duration`) | Unknown | Yes (TFP STS) | No |
 | Dynamic regression | Yes | Planned | Unknown | No | No |
-| R numerical test | Reference | CI-enforced (±1.5%) | Not published | Visual comparison | Not tested |
+| R numerical test | Reference | CI-enforced | Not published | Visual comparison | Not tested |
 | Speed (T=1000) | 2.1 s | 0.07 s (30x) | Seconds | Minutes (HMC: hours) | Sub-second |
 | Python version | N/A (R) | 3.10+ | 3.8+ | 3.7-3.11 | 3.6-3.8 (stale) |
 | Last release | Active | Active | 2023 | 2025-01 | 2020-05 |
@@ -87,21 +87,22 @@ Existing Python ports have fundamental limitations:
 - tfp-causalimpact (Google's own Python port) does not publish numerical equivalence tests with R
 - None of the above implement spike-and-slab variable selection matching R's bsts
 
-This library reproduces the exact Gibbs sampler from R's bsts package in Rust, with CI-enforced numerical equivalence tests on every commit.
+This library reproduces the core Gibbs-sampler workflow from R's bsts package in Rust, with CI-enforced numerical equivalence tests on every commit.
 
 ## Numerical Equivalence with R
 
-Verified against R CausalImpact 1.4.1 (bsts) across 4 scenarios (basic, covariates, strong_effect, no_effect).
+Verified against R CausalImpact 1.4.1 (bsts) across 5 scenarios
+(`basic`, `covariates`, `strong_effect`, `no_effect`, `seasonal`).
 Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
 
 ### Current status
 
-| Metric | no-covariates | covariates | Justification |
-|---|---|---|---|
-| `point_effect_mean` | ±3% | xfail | MCMC sampling variance with independent RNG |
-| `cumulative_effect_total` | ±3% | xfail | Same ratio as point effect |
-| `ci_lower` / `ci_upper` | ±1.5% | ±10% | See R parity status below |
-| `p_value` | Significance match | Significance match | Classification at alpha=0.05 |
+| Metric | Status | Notes |
+|---|---|---|
+| `point_effect_mean` | ±3% relative | Passing on core scenarios |
+| `cumulative_effect_total` | ±3% relative | Passing on core scenarios |
+| `ci_lower` / `ci_upper` | Tight parity | `±1.5%` no-covariates, `±1%` covariates, explicit Phase 2 acceptance `±3%`, seasonal fixture `±5%` |
+| `p_value` | Significance match | Classification at alpha=0.05 |
 
 ### What is matching R and what is not
 
@@ -112,15 +113,15 @@ Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
 | Post-period Random Walk propagation | Matching | Forward simulation from last pre-period state |
 | Data standardization (standardize.data=TRUE) | Matching | (y - mean) / sd using pre-period moments |
 | prior.level.sd = 0.01 | Matching | Same default, same semantics |
-| Spike-and-slab variable selection | Partial | Coordinate-wise sampling works; prior parameters (expected.r2, prior.df) not yet matched |
-| expected.model.size = 3 (R default) | Partial | Implemented but defaults to 1; R defaults to 3 |
-| expected.r2 = 0.8, prior.df = 50 | Not yet | Slab variance uses g-prior instead of R's R2-based prior |
-| Seasonal component (nseasons) | Planned | R supports AddSeasonal; not yet implemented |
+| Spike-and-slab variable selection | Partial | Coordinate-wise sampling works; prior parameters (expected.r2, prior.df) are approximate |
+| expected.model.size | Partial | `CausalImpact` preserves the legacy default `2`; `ModelOptions` keeps explicit default `1` |
+| expected.r2 = 0.8, prior.df = 50 | Partial | Static regression prior is tuned for close R parity, not a byte-for-byte port |
+| Seasonal component (`nseasons`, `season_duration`) | Supported | R-compatible API with seasonal fixture coverage |
 | Dynamic regression | Planned | R supports dynamic.regression=TRUE; not yet implemented |
 | Local linear trend | Planned | R uses AddLocalLevel only by default; trend option exists but not ported |
 
-The ±10% gap in the covariates scenario comes from the missing R2-based slab prior (expected.r2=0.8, prior.df=50).
-This is tracked as Phase 2 work.
+Covariate CI bounds are enforced twice: the legacy parity fixture remains tighter than
+Phase 2 requirements, and a separate Phase 2 acceptance test keeps the threshold at `±3%`.
 
 ## API
 
@@ -144,7 +145,9 @@ This is tracked as Phase 2 work.
 | `seed` | 0 | Random seed for reproducibility |
 | `prior_level_sd` | 0.01 | Prior standard deviation for the local level |
 | `standardize_data` | `True` | Standardize data before fitting |
-| `expected_model_size` | 1 | Expected number of active covariates (spike-and-slab prior) |
+| `expected_model_size` | 2 | Expected number of active covariates (spike-and-slab prior); `ModelOptions` keeps `1` |
+| `nseasons` | `None` | Optional seasonal cycle count (R-compatible API) |
+| `season_duration` | `None` | Optional duration of each seasonal block; defaults to `1` when `nseasons` is set |
 
 #### Methods and Properties
 

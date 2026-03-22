@@ -61,6 +61,24 @@ class TestSamplerShapes:
         rounded_unique_states = {round(state, 9) for state in post_states}
         assert len(rounded_unique_states) > 1
 
+    def test_sampler_with_seasonal_component_returns_same_public_shapes(self):
+        y = [10.0 + [0.0, 1.0, 2.0, 1.0, 0.0, -1.0, -2.0][i % 7] for i in range(84)]
+        result = run_gibbs_sampler(
+            y=y,
+            x=None,
+            pre_end=56,
+            niter=20,
+            nwarmup=5,
+            nchains=1,
+            seed=42,
+            prior_level_sd=0.01,
+            nseasons=7,
+            season_duration=1,
+        )
+        assert len(result.states) == 20
+        assert len(result.states[0]) == 84
+        assert len(result.predictions[0]) == 28
+
 
 class TestSamplerReproducibility:
     """シード固定での再現性."""
@@ -260,6 +278,38 @@ class TestSamplerErrors:
                 nchains=1,
                 seed=42,
                 prior_level_sd=0.01,
+            )
+
+    def test_sampler_rejects_non_integer_nseasons(self):
+        y = [1.0, 2.0, 3.0, 4.0, 5.0]
+        with pytest.raises(ValueError, match="nseasons"):
+            run_gibbs_sampler(
+                y=y,
+                x=None,
+                pre_end=3,
+                niter=5,
+                nwarmup=0,
+                nchains=1,
+                seed=42,
+                prior_level_sd=0.01,
+                nseasons=7.5,
+                season_duration=1,
+            )
+
+    def test_sampler_rejects_zero_season_duration(self):
+        y = [1.0, 2.0, 3.0, 4.0, 5.0]
+        with pytest.raises(ValueError, match="season_duration"):
+            run_gibbs_sampler(
+                y=y,
+                x=None,
+                pre_end=3,
+                niter=5,
+                nwarmup=0,
+                nchains=1,
+                seed=42,
+                prior_level_sd=0.01,
+                nseasons=7,
+                season_duration=0,
             )
 
 

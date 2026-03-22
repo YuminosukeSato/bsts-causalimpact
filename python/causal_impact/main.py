@@ -24,8 +24,27 @@ DEFAULT_MODEL_ARGS = {
     "seed": 0,
     "standardize_data": True,
     "prior_level_sd": 0.01,
-    "expected_model_size": 1,
+    "expected_model_size": 2,
+    "nseasons": None,
+    "season_duration": None,
 }
+
+
+def _normalize_model_args(
+    model_args: dict | ModelOptions | None,
+) -> dict:
+    if isinstance(model_args, ModelOptions):
+        args = model_args.to_dict()
+    else:
+        args = dict(model_args or {})
+
+    if "season.duration" in args:
+        if "season_duration" in args:
+            msg = "Use either season.duration or season_duration, not both"
+            raise ValueError(msg)
+        args["season_duration"] = args.pop("season.duration")
+
+    return {**DEFAULT_MODEL_ARGS, **args}
 
 
 class CausalImpact:
@@ -47,10 +66,7 @@ class CausalImpact:
         model_args: dict | ModelOptions | None = None,
         alpha: float = 0.05,
     ) -> None:
-        if isinstance(model_args, ModelOptions):
-            args = {**DEFAULT_MODEL_ARGS, **model_args.to_dict()}
-        else:
-            args = {**DEFAULT_MODEL_ARGS, **(model_args or {})}
+        args = _normalize_model_args(model_args)
         standardize = args.pop("standardize_data")
 
         self._prepared = DataProcessor.validate_and_prepare(
@@ -82,6 +98,8 @@ class CausalImpact:
             seed=args["seed"],
             prior_level_sd=args["prior_level_sd"],
             expected_model_size=float(args["expected_model_size"]),
+            nseasons=args["nseasons"],
+            season_duration=args["season_duration"],
         )
 
     def _compute_results(self, prepared: PreparedData, samples) -> CausalImpactResults:

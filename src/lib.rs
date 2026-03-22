@@ -24,7 +24,21 @@ pub struct GibbsSamples {
 }
 
 #[pyfunction]
-#[pyo3(signature = (y, x, pre_end, niter, nwarmup, nchains, seed, prior_level_sd, expected_model_size=1.0))]
+#[pyo3(
+    signature = (
+        y,
+        x,
+        pre_end,
+        niter,
+        nwarmup,
+        nchains,
+        seed,
+        prior_level_sd,
+        expected_model_size=1.0,
+        nseasons=None,
+        season_duration=None
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 fn run_gibbs_sampler(
     y: Vec<f64>,
@@ -36,6 +50,8 @@ fn run_gibbs_sampler(
     seed: u64,
     prior_level_sd: f64,
     expected_model_size: f64,
+    nseasons: Option<f64>,
+    season_duration: Option<f64>,
 ) -> PyResult<GibbsSamples> {
     let x_vecs: Vec<Vec<f64>> = match x {
         Some(list) => {
@@ -59,6 +75,8 @@ fn run_gibbs_sampler(
         seed,
         prior_level_sd,
         expected_model_size,
+        nseasons,
+        season_duration,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
@@ -76,7 +94,7 @@ fn run_gibbs_sampler(
 /// Provides Gibbs sampler for Bayesian structural time series.
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", "0.2.0")?;
     m.add_class::<GibbsSamples>()?;
     m.add_function(wrap_pyfunction!(run_gibbs_sampler, m)?)?;
     Ok(())

@@ -19,6 +19,8 @@ class ModelOptions:
     standardize_data: bool = True
     prior_level_sd: float = 0.01
     expected_model_size: int = 1
+    nseasons: int | None = None
+    season_duration: int | None = None
 
     def __post_init__(self) -> None:
         if self.niter < 1:
@@ -36,6 +38,26 @@ class ModelOptions:
         if self.expected_model_size <= 0:
             msg = f"expected_model_size must be > 0, got {self.expected_model_size}"
             raise ValueError(msg)
+        if self.nseasons is not None:
+            if not isinstance(self.nseasons, int):
+                msg = f"nseasons must be an integer, got {self.nseasons}"
+                raise ValueError(msg)
+            if self.nseasons < 1:
+                msg = f"nseasons must be >= 1, got {self.nseasons}"
+                raise ValueError(msg)
+            if self.season_duration is None:
+                object.__setattr__(self, "season_duration", 1)
+        elif self.season_duration is not None:
+            msg = "nseasons must be provided when season_duration is set"
+            raise ValueError(msg)
+
+        if self.season_duration is not None:
+            if not isinstance(self.season_duration, int):
+                msg = f"season_duration must be an integer, got {self.season_duration}"
+                raise ValueError(msg)
+            if self.season_duration < 1:
+                msg = f"season_duration must be >= 1, got {self.season_duration}"
+                raise ValueError(msg)
 
     def to_dict(self) -> dict:
         """Convert to dict for backward compatibility with dict-based model_args."""

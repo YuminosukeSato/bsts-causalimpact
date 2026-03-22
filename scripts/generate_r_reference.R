@@ -35,6 +35,10 @@ scenarios <- list(
   no_effect = list(
     seed = 42, effect = 0.0, noise = 1.0, k = 0,
     n = 100, n_pre = 70
+  ),
+  seasonal = list(
+    seed = 7, effect = 3.0, noise = 0.3, k = 0,
+    n = 112, n_pre = 84, nseasons = 7, season_duration = 1
   )
 )
 
@@ -49,6 +53,13 @@ for (name in names(scenarios)) {
   # Data generation: y = 1.0 + effect*(t > n_pre) + N(0, noise^2) + covariates
   noise <- rnorm(n, 0, s$noise)
   y <- rep(1.0, n) + noise
+
+  if (!is.null(s$nseasons)) {
+    season_levels <- ((1:s$nseasons) - mean(1:s$nseasons)) * 0.8
+    seasonal_pattern <- rep(season_levels, each = s$season_duration)
+    y <- y + rep(seasonal_pattern, length.out = n)
+  }
+
   y[(n_pre + 1):n] <- y[(n_pre + 1):n] + s$effect
 
   x_data <- NULL
@@ -77,9 +88,15 @@ for (name in names(scenarios)) {
   pre_period <- c(1, n_pre)
   post_period <- c(n_pre + 1, n)
 
+  model_args <- list(niter = 5000, prior.level.sd = 0.01)
+  if (!is.null(s$nseasons)) {
+    model_args$nseasons <- s$nseasons
+    model_args$season.duration <- s$season_duration
+  }
+
   ci <- CausalImpact(
     df, pre_period, post_period,
-    model.args = list(niter = 5000, prior.level.sd = 0.01)
+    model.args = model_args
   )
 
   # Extract summary statistics
@@ -105,6 +122,7 @@ for (name in names(scenarios)) {
     true_effect = s$effect,
     noise_sd = s$noise,
     k = s$k,
+    model_args = model_args[names(model_args) != "niter" & names(model_args) != "prior.level.sd"],
     data = list(
       y = as.numeric(y),
       x = x_data
