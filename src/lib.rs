@@ -1,13 +1,77 @@
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
 mod distributions;
 mod kalman;
+mod sampler;
 mod state_space;
+
+#[pyclass]
+#[derive(Clone)]
+pub struct GibbsSamples {
+    #[pyo3(get)]
+    pub states: Vec<Vec<f64>>,
+    #[pyo3(get)]
+    pub sigma_obs: Vec<f64>,
+    #[pyo3(get)]
+    pub sigma_level: Vec<f64>,
+    #[pyo3(get)]
+    pub beta: Vec<Vec<f64>>,
+    #[pyo3(get)]
+    pub predictions: Vec<Vec<f64>>,
+}
+
+#[pyfunction]
+#[pyo3(signature = (y, x, pre_end, niter, nwarmup, nchains, seed, prior_level_sd))]
+fn run_gibbs_sampler(
+    y: Vec<f64>,
+    x: Option<&Bound<'_, PyList>>,
+    pre_end: usize,
+    niter: usize,
+    nwarmup: usize,
+    nchains: usize,
+    seed: u64,
+    prior_level_sd: f64,
+) -> PyResult<GibbsSamples> {
+    let x_vecs: Vec<Vec<f64>> = match x {
+        Some(list) => {
+            let mut cols = Vec::new();
+            for item in list.iter() {
+                let col: Vec<f64> = item.extract()?;
+                cols.push(col);
+            }
+            cols
+        }
+        None => vec![],
+    };
+
+    let result = sampler::run_sampler(
+        y,
+        x_vecs,
+        pre_end,
+        niter,
+        nwarmup,
+        nchains,
+        seed,
+        prior_level_sd,
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+
+    Ok(GibbsSamples {
+        states: result.states,
+        sigma_obs: result.sigma_obs,
+        sigma_level: result.sigma_level,
+        beta: result.beta,
+        predictions: result.predictions,
+    })
+}
 
 /// CausalImpact Rust core module.
 /// Provides Gibbs sampler for Bayesian structural time series.
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", "0.1.0")?;
+    m.add_class::<GibbsSamples>()?;
+    m.add_function(wrap_pyfunction!(run_gibbs_sampler, m)?)?;
     Ok(())
 }
