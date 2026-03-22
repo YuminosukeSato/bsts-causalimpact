@@ -1,0 +1,16 @@
+[package]
+name = "causal_impact_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "causal_impact_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"
+nalgebra = "0.33"
+rand = "0.8"
+rand_distr = "0.4"
+statrs = "0.18"

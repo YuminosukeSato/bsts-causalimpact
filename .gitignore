@@ -1,0 +1,12 @@
+target/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+z-ai/
+*.DS_Store
