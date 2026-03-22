@@ -1,5 +1,9 @@
 use pyo3::prelude::*;
 
+mod distributions;
+mod kalman;
+mod state_space;
+
 /// CausalImpact Rust core module.
 /// Provides Gibbs sampler for Bayesian structural time series.
 #[pymodule]
