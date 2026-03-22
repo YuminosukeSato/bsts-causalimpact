@@ -72,7 +72,7 @@ fig.savefig("causal_impact.png")
 | Dependencies | R, bsts | numpy, pandas, matplotlib | TF, TFP (3 GB+) | TF, TFP (3 GB+) | statsmodels |
 | Spike-and-slab | Yes | Yes | Unknown | No | No |
 | Seasonal component | Yes | Yes (`nseasons`, `season_duration`) | Unknown | Yes (TFP STS) | No |
-| Dynamic regression | Yes | Planned | Unknown | No | No |
+| Dynamic regression | Yes | Yes (`dynamic_regression=True`) | Unknown | No | No |
 | R numerical test | Reference | CI-enforced | Not published | Visual comparison | Not tested |
 | Speed (T=1000) | 2.1 s | 0.07 s (30x) | Seconds | Minutes (HMC: hours) | Sub-second |
 | Python version | N/A (R) | 3.10+ | 3.8+ | 3.7-3.11 | 3.6-3.8 (stale) |
@@ -117,7 +117,7 @@ Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
 | expected.model.size | Partial | `CausalImpact` preserves the legacy default `2`; `ModelOptions` keeps explicit default `1` |
 | expected.r2 = 0.8, prior.df = 50 | Partial | Static regression prior is tuned for close R parity, not a byte-for-byte port |
 | Seasonal component (`nseasons`, `season_duration`) | Supported | R-compatible API with seasonal fixture coverage |
-| Dynamic regression | Planned | R supports dynamic.regression=TRUE; not yet implemented |
+| Dynamic regression | Supported | Time-varying coefficients via random-walk FFBS; `dynamic_regression=True` |
 | Local linear trend | Planned | R uses AddLocalLevel only by default; trend option exists but not ported |
 
 Covariate CI bounds are enforced twice: the legacy parity fixture remains tighter than
@@ -148,6 +148,7 @@ Phase 2 requirements, and a separate Phase 2 acceptance test keeps the threshold
 | `expected_model_size` | 2 | Expected number of active covariates (spike-and-slab prior); `ModelOptions` keeps `1` |
 | `nseasons` | `None` | Optional seasonal cycle count (R-compatible API) |
 | `season_duration` | `None` | Optional duration of each seasonal block; defaults to `1` when `nseasons` is set |
+| `dynamic_regression` | `False` | Enable time-varying regression coefficients (random-walk beta) |
 
 #### Methods and Properties
 
