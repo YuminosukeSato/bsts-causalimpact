@@ -1,5 +1,5 @@
 use crate::distributions::{sample_inv_gamma, sample_mvnormal, sample_normal};
-use crate::kalman::simulation_smoother;
+use crate::kalman::{dynamic_beta_smoother, simulation_smoother};
 use crate::state_space::{SeasonalConfig, StateSpaceModel};
 use rand::distributions::Bernoulli;
 use rand::rngs::StdRng;
@@ -51,11 +51,12 @@ pub fn run_sampler(
     expected_model_size: f64,
     nseasons: Option<f64>,
     season_duration: Option<f64>,
+    dynamic_regression: bool,
 ) -> Result<GibbsResult, String> {
     validate_inputs(&y, pre_end, nchains)?;
 
     let k = x.len();
-    if k > 0 && expected_model_size <= 0.0 {
+    if k > 0 && expected_model_size <= 0.0 && !dynamic_regression {
         return Err("expected_model_size must be > 0 when covariates are present".to_string());
     }
 
@@ -75,6 +76,7 @@ pub fn run_sampler(
                 prior_level_sd,
                 chain_id,
                 expected_model_size,
+                dynamic_regression,
             )
         })
         .collect();
@@ -107,6 +109,238 @@ fn validate_inputs(y: &[f64], pre_end: usize, nchains: usize) -> Result<(), Stri
 
 #[allow(clippy::too_many_arguments)]
 fn run_single_chain(
+    y: &[f64],
+    model: &StateSpaceModel,
+    pre_end: usize,
+    niter: usize,
+    nwarmup: usize,
+    seed: u64,
+    prior_level_sd: f64,
+    chain_id: usize,
+    expected_model_size: f64,
+    dynamic_regression: bool,
+) -> ChainResult {
+    if dynamic_regression {
+        run_single_chain_dynamic(
+            y,
+            model,
+            pre_end,
+            niter,
+            nwarmup,
+            seed,
+            prior_level_sd,
+            chain_id,
+        )
+    } else {
+        run_single_chain_static(
+            y,
+            model,
+            pre_end,
+            niter,
+            nwarmup,
+            seed,
+            prior_level_sd,
+            chain_id,
+            expected_model_size,
+        )
+    }
+}
+
+/// Dynamic regression chain: time-varying β_t via multivariate FFBS.
+/// Spike-and-slab is disabled; gamma is always empty.
+#[allow(clippy::too_many_arguments)]
+fn run_single_chain_dynamic(
+    y: &[f64],
+    model: &StateSpaceModel,
+    pre_end: usize,
+    niter: usize,
+    nwarmup: usize,
+    seed: u64,
+    prior_level_sd: f64,
+    chain_id: usize,
+) -> ChainResult {
+    let t_total = y.len();
+    let k = model.num_covariates();
+    let k_seasonal = model.num_seasonal_covariates();
+    let y_sd = sample_standard_deviation(&y[..pre_end]);
+    let seasonal_regression_prior =
+        (k_seasonal > 0).then(|| build_static_regression_prior(model.seasonal_covariates(), y_sd));
+    let chain_seed = seed ^ (chain_id as u64).wrapping_mul(SEED_PRIME);
+    let mut rng = StdRng::seed_from_u64(chain_seed);
+    let mut sigma2_obs = 1.0;
+    let mut sigma2_level = (prior_level_sd * prior_level_sd).max(1e-6);
+    let mut seasonal_beta = vec![0.0; k_seasonal];
+
+    // Dynamic regression state variables
+    let mut beta_t: Vec<Vec<f64>> = vec![vec![0.0; k]; pre_end];
+    let sigma_guess_beta = y_sd / (pre_end as f64).sqrt();
+    let initial_sigma2_beta = sigma_guess_beta * sigma_guess_beta;
+    let mut sigma2_beta = vec![initial_sigma2_beta.max(1e-8); k];
+    let init_beta_mean = vec![0.0; k];
+
+    // σ²_β prior: InvGamma(shape=16, scale=16 * sigma_guess_beta²)
+    let sigma2_beta_prior_shape = 16.0;
+    let sigma2_beta_prior_scale = sigma2_beta_prior_shape * initial_sigma2_beta;
+
+    let mut chain_result = ChainResult {
+        chain_id,
+        states: Vec::with_capacity(niter),
+        sigma_obs: Vec::with_capacity(niter),
+        sigma_level: Vec::with_capacity(niter),
+        beta: Vec::with_capacity(niter),
+        gamma: Vec::with_capacity(0), // spike-and-slab disabled
+        predictions: Vec::with_capacity(niter),
+    };
+
+    for iter in 0..(niter + nwarmup) {
+        // Step 1: State sampling — subtract time-varying x'β_t from y
+        let y_adj = adjusted_observations_dynamic(y, model, &beta_t, &seasonal_beta, pre_end);
+        let states = simulation_smoother(
+            &mut rng,
+            &y_adj,
+            sigma2_obs,
+            sigma2_level,
+            y[0],
+            y_sd * y_sd,
+        );
+
+        // Step 2: Dynamic β_t sampling via multivariate FFBS
+        if k > 0 {
+            let y_adj_beta: Vec<f64> = y[..pre_end]
+                .iter()
+                .zip(states.iter())
+                .enumerate()
+                .map(|(t, (&y_val, &mu))| {
+                    y_val - mu - block_contribution(model.seasonal_covariates(), &seasonal_beta, t)
+                })
+                .collect();
+
+            beta_t = dynamic_beta_smoother(
+                &mut rng,
+                &y_adj_beta,
+                model.covariates(),
+                sigma2_obs,
+                &sigma2_beta,
+                &init_beta_mean,
+                1e2, // Diffuse but numerically stable (std dev = 10)
+            );
+        }
+
+        // Step 3: σ²_obs sampling
+        let sse_obs: f64 = y[..pre_end]
+            .iter()
+            .zip(states.iter())
+            .enumerate()
+            .map(|(t, (&y_val, &mu))| {
+                let reg = if k > 0 {
+                    block_contribution(model.covariates(), &beta_t[t], t)
+                } else {
+                    0.0
+                };
+                let seasonal = block_contribution(model.seasonal_covariates(), &seasonal_beta, t);
+                let err = y_val - mu - reg - seasonal;
+                err * err
+            })
+            .sum();
+        let sigma_guess = sample_standard_deviation(&y[..pre_end]);
+        let obs_prior_df = 0.01;
+        let obs_a = obs_prior_df / 2.0;
+        let obs_b = obs_a * sigma_guess * sigma_guess;
+        let obs_shape = obs_a + pre_end as f64 / 2.0;
+        let obs_scale = obs_b + sse_obs / 2.0;
+        sigma2_obs = sample_inv_gamma(&mut rng, obs_shape, obs_scale).max(1e-12);
+
+        // Step 4: σ²_level sampling (same as static)
+        sigma2_level = sample_sigma2_level(&mut rng, &states, pre_end, prior_level_sd, y_sd);
+
+        // Step 5: σ²_β sampling per covariate (InvGamma posterior)
+        if k > 0 {
+            for j in 0..k {
+                let ssd: f64 = beta_t
+                    .windows(2)
+                    .map(|w| {
+                        let d = w[1][j] - w[0][j];
+                        d * d
+                    })
+                    .sum();
+                let shape = sigma2_beta_prior_shape + (pre_end - 1) as f64 / 2.0;
+                let scale = sigma2_beta_prior_scale + ssd / 2.0;
+                sigma2_beta[j] = sample_inv_gamma(&mut rng, shape, scale).max(1e-12);
+            }
+        }
+
+        // Seasonal beta sampling (static, same as non-dynamic path)
+        if k_seasonal > 0 {
+            let prior = seasonal_regression_prior
+                .as_ref()
+                .expect("seasonal regression prior must exist when seasonal regressors exist");
+            let baseline: Vec<f64> = states
+                .iter()
+                .enumerate()
+                .map(|(t, &mu)| {
+                    mu + if k > 0 {
+                        block_contribution(model.covariates(), &beta_t[t], t)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            seasonal_beta = sample_beta_with_normal_prior(
+                &mut rng,
+                &y[..pre_end],
+                &baseline,
+                model.seasonal_covariates(),
+                sigma2_obs,
+                &prior.beta_mean,
+                &prior.beta_precision,
+            );
+        }
+
+        if iter >= nwarmup {
+            let states_post = sample_post_period_states(
+                &mut rng,
+                states[pre_end - 1],
+                t_total - pre_end,
+                sigma2_level,
+            );
+            let full_states = combine_state_paths(&states, &states_post);
+
+            // Dynamic predictions: propagate β via random walk
+            let beta_last = if k > 0 {
+                beta_t[pre_end - 1].clone()
+            } else {
+                vec![]
+            };
+            let predictions = generate_predictions_dynamic(
+                &states_post,
+                &beta_last,
+                &sigma2_beta,
+                &seasonal_beta,
+                model,
+                pre_end,
+                sigma2_obs,
+                &mut rng,
+            );
+
+            chain_result.states.push(full_states);
+            chain_result.sigma_obs.push(sigma2_obs.sqrt());
+            chain_result.sigma_level.push(sigma2_level.sqrt());
+            chain_result.beta.push(if k > 0 {
+                beta_t[pre_end - 1].clone()
+            } else {
+                vec![]
+            });
+            // gamma stays empty for dynamic regression
+            chain_result.predictions.push(predictions);
+        }
+    }
+
+    chain_result
+}
+
+/// Static regression chain: original Gibbs sampler with fixed β.
+#[allow(clippy::too_many_arguments)]
+fn run_single_chain_static(
     y: &[f64],
     model: &StateSpaceModel,
     pre_end: usize,
@@ -365,6 +599,29 @@ fn adjusted_observations(
         .take(pre_end)
         .enumerate()
         .map(|(t, y_value)| y_value - model.regression_contribution(t, beta, seasonal_beta))
+        .collect()
+}
+
+/// Adjusted observations for dynamic regression: subtract time-varying x'β_t.
+fn adjusted_observations_dynamic(
+    y: &[f64],
+    model: &StateSpaceModel,
+    beta_t: &[Vec<f64>],
+    seasonal_beta: &[f64],
+    pre_end: usize,
+) -> Vec<f64> {
+    y.iter()
+        .take(pre_end)
+        .enumerate()
+        .map(|(t, y_value)| {
+            let dynamic_reg = if !beta_t.is_empty() && !beta_t[0].is_empty() {
+                block_contribution(model.covariates(), &beta_t[t], t)
+            } else {
+                0.0
+            };
+            let seasonal_reg = block_contribution(model.seasonal_covariates(), seasonal_beta, t);
+            y_value - dynamic_reg - seasonal_reg
+        })
         .collect()
 }
 
@@ -743,6 +1000,38 @@ fn generate_predictions<R: rand::Rng>(
         .collect()
 }
 
+/// Generate post-period predictions with dynamic β propagation.
+/// β_{T+j} = β_{T+j-1} + N(0, diag(σ²_β)) — random walk continues.
+#[allow(clippy::too_many_arguments)]
+fn generate_predictions_dynamic<R: rand::Rng>(
+    states_post: &[f64],
+    beta_last: &[f64],
+    sigma2_beta: &[f64],
+    seasonal_beta: &[f64],
+    model: &StateSpaceModel,
+    pre_end: usize,
+    sigma2_obs: f64,
+    rng: &mut R,
+) -> Vec<f64> {
+    let k = beta_last.len();
+    let mut beta_current = beta_last.to_vec();
+
+    states_post
+        .iter()
+        .enumerate()
+        .map(|(offset, &state)| {
+            let t = pre_end + offset;
+            // Propagate β via random walk
+            for j in 0..k {
+                beta_current[j] += sample_normal(rng, 0.0, sigma2_beta[j]);
+            }
+            let dynamic_reg = block_contribution(model.covariates(), &beta_current, t);
+            let seasonal_reg = block_contribution(model.seasonal_covariates(), seasonal_beta, t);
+            state + dynamic_reg + seasonal_reg + sample_normal(rng, 0.0, sigma2_obs)
+        })
+        .collect()
+}
+
 fn invert_matrix(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let k = a.len();
     if k == 1 {
@@ -825,7 +1114,8 @@ mod tests {
     #[test]
     fn test_run_sampler_basic() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
-        let result = run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0, None, None).unwrap();
+        let result =
+            run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, false).unwrap();
         assert_eq!(result.states.len(), 10);
         assert_eq!(result.sigma_obs.len(), 10);
         assert_eq!(result.predictions.len(), 10);
@@ -837,7 +1127,8 @@ mod tests {
     fn test_run_sampler_with_covariates() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
-        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0, None, None).unwrap();
+        let result =
+            run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, false).unwrap();
         assert_eq!(result.beta.len(), 10);
         assert_eq!(result.beta[0].len(), 1);
         assert_eq!(result.gamma.len(), 10);
@@ -846,14 +1137,27 @@ mod tests {
 
     #[test]
     fn test_run_sampler_empty_y() {
-        let result = run_sampler(vec![], vec![], 0, 10, 5, 1, 42, 0.01, 1.0, None, None);
+        let result = run_sampler(
+            vec![],
+            vec![],
+            0,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_run_sampler_pre_end_equals_t() {
         let y: Vec<f64> = vec![1.0, 2.0, 3.0];
-        let result = run_sampler(y, vec![], 3, 10, 5, 1, 42, 0.01, 1.0, None, None);
+        let result = run_sampler(y, vec![], 3, 10, 5, 1, 42, 0.01, 1.0, None, None, false);
         assert!(result.is_err());
     }
 
@@ -861,7 +1165,7 @@ mod tests {
     fn test_run_sampler_expected_model_size_validation() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
-        // k>0 with expected_model_size=0 should fail
+        // k>0 with expected_model_size=0 should fail (static only)
         let result = run_sampler(
             y.clone(),
             vec![x1.clone()],
@@ -874,10 +1178,11 @@ mod tests {
             0.0,
             None,
             None,
+            false,
         );
         assert!(result.is_err());
         // k>0 with negative should fail
-        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, -1.0, None, None);
+        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, -1.0, None, None, false);
         assert!(result.is_err());
     }
 
@@ -926,5 +1231,57 @@ mod tests {
         let inv = invert_matrix(&a);
         assert!((inv[0][0] - 1.0).abs() < 1e-10);
         assert!((inv[1][1] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_run_sampler_dynamic_regression_basic() {
+        let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
+        let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
+        let result =
+            run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, true).unwrap();
+        assert_eq!(result.predictions.len(), 10);
+        assert_eq!(result.predictions[0].len(), 5);
+        // gamma should be empty (spike-and-slab disabled)
+        assert!(result.gamma.is_empty());
+    }
+
+    #[test]
+    fn test_run_sampler_dynamic_regression_k0_same_as_static() {
+        let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
+        let result_dyn = run_sampler(
+            y.clone(),
+            vec![],
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let result_static =
+            run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, false).unwrap();
+        // With k=0, both paths should produce identical predictions
+        assert_eq!(
+            result_dyn.predictions.len(),
+            result_static.predictions.len()
+        );
+    }
+
+    #[test]
+    fn test_run_sampler_dynamic_regression_predictions_finite() {
+        let y: Vec<f64> = (0..30).map(|i| 5.0 + (i as f64 * 0.1).sin()).collect();
+        let x1: Vec<f64> = (0..30).map(|i| (i as f64 * 0.2).cos()).collect();
+        let result =
+            run_sampler(y, vec![x1], 20, 20, 10, 1, 42, 0.01, 1.0, None, None, true).unwrap();
+        for pred_row in &result.predictions {
+            for &val in pred_row {
+                assert!(val.is_finite(), "Non-finite prediction: {}", val);
+            }
+        }
     }
 }

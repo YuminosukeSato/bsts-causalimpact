@@ -36,7 +36,8 @@ pub struct GibbsSamples {
         prior_level_sd,
         expected_model_size=1.0,
         nseasons=None,
-        season_duration=None
+        season_duration=None,
+        dynamic_regression=false
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -52,6 +53,7 @@ fn run_gibbs_sampler(
     expected_model_size: f64,
     nseasons: Option<f64>,
     season_duration: Option<f64>,
+    dynamic_regression: bool,
 ) -> PyResult<GibbsSamples> {
     let x_vecs: Vec<Vec<f64>> = match x {
         Some(list) => {
@@ -77,6 +79,7 @@ fn run_gibbs_sampler(
         expected_model_size,
         nseasons,
         season_duration,
+        dynamic_regression,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
