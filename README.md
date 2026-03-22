@@ -71,8 +71,8 @@ fig.savefig("causal_impact.png")
 | Algorithm | Gibbs (bsts/C++) | Gibbs (Rust) | TFP-based | VI default / HMC | MLE (statsmodels) |
 | Dependencies | R, bsts | numpy, pandas, matplotlib | TF, TFP (3 GB+) | TF, TFP (3 GB+) | statsmodels |
 | Spike-and-slab | Yes | Yes | Unknown | No | No |
-| Seasonal component | Yes | No (planned) | Unknown | Yes (TFP STS) | No |
-| Dynamic regression | Yes | No (planned) | Unknown | No | No |
+| Seasonal component | Yes | Planned | Unknown | Yes (TFP STS) | No |
+| Dynamic regression | Yes | Planned | Unknown | No | No |
 | R numerical test | Reference | CI-enforced (±1.5%) | Not published | Visual comparison | Not tested |
 | Speed (T=1000) | 2.1 s | 0.07 s (30x) | Seconds | Minutes (HMC: hours) | Sub-second |
 | Python version | N/A (R) | 3.10+ | 3.8+ | 3.7-3.11 | 3.6-3.8 (stale) |
@@ -115,9 +115,9 @@ Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
 | Spike-and-slab variable selection | Partial | Coordinate-wise sampling works; prior parameters (expected.r2, prior.df) not yet matched |
 | expected.model.size = 3 (R default) | Partial | Implemented but defaults to 1; R defaults to 3 |
 | expected.r2 = 0.8, prior.df = 50 | Not yet | Slab variance uses g-prior instead of R's R2-based prior |
-| Seasonal component (nseasons) | Not yet | R supports AddSeasonal; not implemented here |
-| Dynamic regression | Not yet | R supports dynamic.regression=TRUE; not implemented |
-| Local linear trend | Not yet | R uses AddLocalLevel only by default; trend option exists but not ported |
+| Seasonal component (nseasons) | Planned | R supports AddSeasonal; not yet implemented |
+| Dynamic regression | Planned | R supports dynamic.regression=TRUE; not yet implemented |
+| Local linear trend | Planned | R uses AddLocalLevel only by default; trend option exists but not ported |
 
 The ±10% gap in the covariates scenario comes from the missing R2-based slab prior (expected.r2=0.8, prior.df=50).
 This is tracked as Phase 2 work.
