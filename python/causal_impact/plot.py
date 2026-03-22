@@ -57,12 +57,18 @@ class Plotter:
     def _plot_original(ax, y, time_index, post_index, results):
         ax.plot(time_index, y, color="black", linewidth=1, label="Observed")
         ax.plot(
-            post_index, results.predictions_mean, color="blue",
-            linestyle="--", label="Counterfactual",
+            post_index,
+            results.predictions_mean,
+            color="blue",
+            linestyle="--",
+            label="Counterfactual",
         )
         ax.fill_between(
-            post_index, results.predictions_lower, results.predictions_upper,
-            alpha=0.2, color="blue",
+            post_index,
+            results.predictions_lower,
+            results.predictions_upper,
+            alpha=0.2,
+            color="blue",
         )
         ax.set_ylabel("Response")
         ax.legend(loc="upper left", fontsize=8)

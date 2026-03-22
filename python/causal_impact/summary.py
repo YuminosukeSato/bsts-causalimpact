@@ -37,8 +37,10 @@ class SummaryFormatter:
         ]
 
         if results.p_value < 0.05:
-            lines.append("Posterior prob. of a causal effect: "
-                         f"{format((1 - results.p_value) * 100, fmt)}%")
+            lines.append(
+                "Posterior prob. of a causal effect: "
+                f"{format((1 - results.p_value) * 100, fmt)}%"
+            )
         else:
             lines.append("The effect is not statistically significant.")
 

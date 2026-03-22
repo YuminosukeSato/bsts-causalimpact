@@ -83,7 +83,7 @@ class TestCIAndPValue:
 
 
 class TestCumulativeAndRelative:
-    """累積効果と相対効果."""""
+    """累積効果と相対効果.""" ""
 
     def test_cumulative_effect_monotone(self):
         """正の効果のみの場合、累積効果は単調増加."""
