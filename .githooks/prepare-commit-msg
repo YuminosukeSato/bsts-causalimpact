@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Claude Code の attribution / Co-Authored-By trailer をコミット前に削除する safety net
+# 有効化: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+MSG_FILE="${1:-}"
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+  exit 0
+fi
+
+python3 - "$MSG_FILE" <<'PY'
+import re, sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+text = p.read_text(encoding="utf-8", errors="replace")
+lines = text.splitlines()
+
+
+def is_claude_line(line: str) -> bool:
+    s = line.strip()
+    if re.match(r"^Generated with(\s+\[Claude Code\])?", s, re.IGNORECASE):
+        return True
+    if "claude.ai/code" in s or "code.claude.com" in s:
+        return True
+    if re.match(r"^Co-Authored-By:\s*Claude\b", s, re.IGNORECASE):
+        return True
+    return False
+
+
+# 末尾から Claude attribution 行を削除
+while lines and (is_claude_line(lines[-1]) or lines[-1].strip() == ""):
+    if is_claude_line(lines[-1]):
+        lines.pop()
+        while lines and lines[-1].strip() == "":
+            lines.pop()
+    else:
+        lines.pop()
+
+out = "\n".join(lines).rstrip() + "\n"
+p.write_text(out, encoding="utf-8")
+PY
+
+exit 0
