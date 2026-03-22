@@ -23,6 +23,7 @@ DEFAULT_MODEL_ARGS = {
     "seed": 0,
     "standardize_data": True,
     "prior_level_sd": 0.01,
+    "expected_model_size": 1,
 }
 
 
@@ -56,8 +57,8 @@ class CausalImpact:
         self._pre_period = pre_period
         self._post_period = post_period
 
-        samples = self._run_sampler(self._prepared, args)
-        self._results = self._compute_results(self._prepared, samples)
+        self._samples = self._run_sampler(self._prepared, args)
+        self._results = self._compute_results(self._prepared, self._samples)
 
     def _run_sampler(self, prepared: PreparedData, args: dict):
         y_full = np.concatenate([prepared.y_pre, prepared.y_post])
@@ -76,6 +77,7 @@ class CausalImpact:
             nchains=args["nchains"],
             seed=args["seed"],
             prior_level_sd=args["prior_level_sd"],
+            expected_model_size=float(args["expected_model_size"]),
         )
 
     def _compute_results(self, prepared: PreparedData, samples) -> CausalImpactResults:
@@ -126,13 +128,28 @@ class CausalImpact:
         return pd.DataFrame(
             {
                 "point_effect": self._results.point_effects,
+                "point_effect_lower": self._results.point_effect_lower,
+                "point_effect_upper": self._results.point_effect_upper,
                 "cumulative_effect": self._results.cumulative_effect,
+                "cumulative_effect_lower": self._results.cumulative_effect_lower,
+                "cumulative_effect_upper": self._results.cumulative_effect_upper,
                 "predicted_mean": self._results.predictions_mean,
                 "predicted_lower": self._results.predictions_lower,
                 "predicted_upper": self._results.predictions_upper,
             },
             index=post_index,
         )
+
+    @property
+    def posterior_inclusion_probs(self) -> np.ndarray | None:
+        """Posterior inclusion probabilities for each covariate.
+
+        Returns None when there are no covariates (k=0).
+        """
+        gamma = self._samples.gamma
+        if not gamma or not gamma[0]:
+            return None
+        return np.array(gamma).mean(axis=0)
 
     @property
     def summary_stats(self) -> dict:

@@ -47,6 +47,17 @@ class TestEndToEnd:
         inferences = ci.inferences
         assert isinstance(inferences, pd.DataFrame)
         assert len(inferences) > 0
+        assert list(inferences.columns) == [
+            "point_effect",
+            "point_effect_lower",
+            "point_effect_upper",
+            "cumulative_effect",
+            "cumulative_effect_lower",
+            "cumulative_effect_upper",
+            "predicted_mean",
+            "predicted_lower",
+            "predicted_upper",
+        ]
 
         stats = ci.summary_stats
         assert isinstance(stats, dict)
@@ -68,6 +79,48 @@ class TestEndToEnd:
         assert ci.summary() is not None
         assert ci.inferences is not None
 
+
+
+class TestSpikeSlabIntegration:
+    """Spike-and-slab integration: multi-covariate vs single-covariate consistency."""
+
+    def test_spike_slab_multicovariate_matches_single(self):
+        """k=3 (1 signal + 2 noise) vs k=1 (signal only): effect within ±20%."""
+        rng = np.random.default_rng(42)
+        n = 200
+        pre_end = 140
+        true_effect = 3.0
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        x_signal = rng.normal(5, 1, n)
+        x_noise1 = rng.normal(0, 1, n)
+        x_noise2 = rng.normal(0, 1, n)
+        y = 2.0 * x_signal + rng.normal(0, 0.5, n)
+        y[pre_end:] += true_effect
+
+        pre_period = [str(dates[0].date()), str(dates[pre_end - 1].date())]
+        post_period = [str(dates[pre_end].date()), str(dates[-1].date())]
+        model_args = {"niter": 1000, "nwarmup": 500, "seed": 42,
+                       "expected_model_size": 1}
+
+        df_multi = pd.DataFrame(
+            {"y": y, "x1": x_signal, "x2": x_noise1, "x3": x_noise2},
+            index=dates,
+        )
+        ci_multi = CausalImpact(df_multi, pre_period, post_period,
+                                 model_args=model_args)
+
+        df_single = pd.DataFrame({"y": y, "x1": x_signal}, index=dates)
+        ci_single = CausalImpact(df_single, pre_period, post_period,
+                                  model_args=model_args)
+
+        effect_multi = ci_multi.summary_stats["point_effect_mean"]
+        effect_single = ci_single.summary_stats["point_effect_mean"]
+
+        ratio = abs(effect_multi - effect_single) / abs(effect_single)
+        assert ratio < 0.20, (
+            f"Multi ({effect_multi:.3f}) vs single ({effect_single:.3f}): "
+            f"ratio {ratio:.3f} > 0.20"
+        )
 
 
 class TestPerformance:
