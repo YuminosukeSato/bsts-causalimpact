@@ -1,7 +1,6 @@
 """Tests for the Rust Gibbs sampler via PyO3 binding."""
 
 import pytest
-
 from causal_impact._core import GibbsSamples, run_gibbs_sampler
 
 

@@ -1,8 +1,6 @@
 """Tests for SummaryFormatter: summary and report output."""
 
 import numpy as np
-import pytest
-
 from causal_impact.analysis import CausalImpactResults
 from causal_impact.summary import SummaryFormatter
 
@@ -59,7 +57,7 @@ class TestReportContent:
     def test_report_significant_effect(self):
         result = _make_results(effect=3.0, p_value=0.001)
         text = SummaryFormatter.report(result)
-        assert "statistically significant" in text.lower() or "significant" in text.lower()
+        assert "significant" in text.lower()
 
     def test_report_no_effect(self):
         result = _make_results(effect=0.1, p_value=0.45)

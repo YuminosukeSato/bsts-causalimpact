@@ -1,0 +1,146 @@
+"""CausalImpact main class: facade for the full analysis pipeline."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+
+from causal_impact._core import run_gibbs_sampler
+from causal_impact.analysis import CausalAnalysis, CausalImpactResults
+from causal_impact.data import DataProcessor, PreparedData
+from causal_impact.plot import Plotter
+from causal_impact.summary import SummaryFormatter
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+
+DEFAULT_MODEL_ARGS = {
+    "niter": 1000,
+    "nwarmup": 500,
+    "nchains": 1,
+    "seed": 0,
+    "standardize_data": True,
+    "prior_level_sd": 0.01,
+}
+
+
+class CausalImpact:
+    """Causal inference using Bayesian structural time series.
+
+    Args:
+        data: DataFrame or ndarray. First column is response, rest are covariates.
+        pre_period: [start, end] of pre-intervention period.
+        post_period: [start, end] of post-intervention period.
+        model_args: MCMC parameters (niter, nwarmup, nchains, seed, prior_level_sd).
+        alpha: Significance level for credible intervals (default 0.05).
+    """
+
+    def __init__(
+        self,
+        data: pd.DataFrame | np.ndarray,
+        pre_period: list[str | int | pd.Timestamp],
+        post_period: list[str | int | pd.Timestamp],
+        model_args: dict | None = None,
+        alpha: float = 0.05,
+    ) -> None:
+        args = {**DEFAULT_MODEL_ARGS, **(model_args or {})}
+        standardize = args.pop("standardize_data")
+
+        self._prepared = DataProcessor.validate_and_prepare(
+            data, pre_period, post_period, alpha=alpha, standardize=standardize
+        )
+        self._alpha = alpha
+        self._data = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+        self._pre_period = pre_period
+        self._post_period = post_period
+
+        samples = self._run_sampler(self._prepared, args)
+        self._results = self._compute_results(self._prepared, samples)
+
+    def _run_sampler(self, prepared: PreparedData, args: dict):
+        y_full = np.concatenate([prepared.y_pre, prepared.y_post])
+
+        x_cols = None
+        if prepared.X_pre is not None and prepared.X_post is not None:
+            X_full = np.vstack([prepared.X_pre, prepared.X_post])
+            x_cols = [X_full[:, j].tolist() for j in range(X_full.shape[1])]
+
+        return run_gibbs_sampler(
+            y=y_full.tolist(),
+            x=x_cols,
+            pre_end=len(prepared.y_pre),
+            niter=args["niter"],
+            nwarmup=args["nwarmup"],
+            nchains=args["nchains"],
+            seed=args["seed"],
+            prior_level_sd=args["prior_level_sd"],
+        )
+
+    def _compute_results(self, prepared: PreparedData, samples) -> CausalImpactResults:
+        predictions = np.array(samples.predictions)
+
+        # De-standardize predictions if needed
+        if prepared.y_sd != 1.0 or prepared.y_mean != 0.0:
+            predictions = predictions * prepared.y_sd + prepared.y_mean
+
+        # De-standardize y_post
+        y_post = prepared.y_post * prepared.y_sd + prepared.y_mean
+
+        return CausalAnalysis.compute_effects(
+            y_post=y_post,
+            predictions=predictions,
+            alpha=self._alpha,
+        )
+
+    def summary(self, output: str = "summary", digits: int = 2) -> str:
+        if output == "report":
+            return SummaryFormatter.report(self._results)
+        return SummaryFormatter.summary(self._results, digits=digits)
+
+    def report(self) -> str:
+        return SummaryFormatter.report(self._results)
+
+    def plot(self, metrics: list[str] | None = None) -> Figure:
+        if isinstance(self._data, pd.DataFrame):
+            y = self._data.iloc[:, 0].values
+        else:
+            arr = np.asarray(self._data)
+            y = arr[:, 0] if arr.ndim > 1 else arr
+
+        return Plotter.plot(
+            self._results,
+            y,
+            self._prepared.time_index,
+            len(self._prepared.y_pre),
+            metrics=metrics,
+        )
+
+    @property
+    def inferences(self) -> pd.DataFrame:
+        t_post = len(self._results.point_effects)
+        pre_end = len(self._prepared.y_pre)
+        post_index = self._prepared.time_index[pre_end : pre_end + t_post]
+
+        return pd.DataFrame(
+            {
+                "point_effect": self._results.point_effects,
+                "cumulative_effect": self._results.cumulative_effect,
+                "predicted_mean": self._results.predictions_mean,
+                "predicted_lower": self._results.predictions_lower,
+                "predicted_upper": self._results.predictions_upper,
+            },
+            index=post_index,
+        )
+
+    @property
+    def summary_stats(self) -> dict:
+        return {
+            "point_effect_mean": self._results.point_effect_mean,
+            "ci_lower": self._results.ci_lower,
+            "ci_upper": self._results.ci_upper,
+            "cumulative_effect_total": self._results.cumulative_effect_total,
+            "relative_effect_mean": self._results.relative_effect_mean,
+            "p_value": self._results.p_value,
+        }

@@ -36,7 +36,6 @@ class CausalAnalysis:
         y_post = np.asarray(y_post, dtype=np.float64)
         predictions = np.asarray(predictions, dtype=np.float64)
 
-        t_post = len(y_post)
         n_samples = predictions.shape[0]
 
         # Effect per sample per time point: observed - counterfactual

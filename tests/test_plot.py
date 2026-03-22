@@ -1,8 +1,6 @@
 """Tests for Plotter: matplotlib output."""
 
 import numpy as np
-import pytest
-
 from causal_impact.analysis import CausalImpactResults
 from causal_impact.plot import Plotter
 
@@ -17,8 +15,6 @@ def _make_results_with_index():
 
     y = np.random.default_rng(42).normal(10, 1, t_total)
     time_index = pd.date_range("2020-01-01", periods=t_total, freq="D")
-    y_post = y[t_pre:]
-
     results = CausalImpactResults(
         point_effects=np.full(t_post, 2.0),
         ci_lower=1.0,

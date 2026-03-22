@@ -22,8 +22,8 @@ class SummaryFormatter:
             "Posterior inference {CausalImpact}",
             "",
             "                         Average        Cumulative",
-            f"Actual                   -              -",
-            f"Prediction (s.d.)        -              -",
+            "Actual                   -              -",
+            "Prediction (s.d.)        -              -",
             f"95% CI                   {avg_ci}       -",
             "",
             f"Absolute effect (mean)   {avg_effect}           {cum_effect}",
@@ -62,19 +62,23 @@ class SummaryFormatter:
             "",
         ]
 
+        p = results.p_value
         if is_significant:
             lines.append(
-                f"This effect is statistically significant (p = {results.p_value:.4f}). "
-                f"The probability of obtaining an effect of this magnitude by chance "
-                f"is very small. Hence, the causal effect can be considered "
-                f"statistically significant."
+                f"This effect is statistically significant "
+                f"(p = {p:.4f}). The probability of obtaining "
+                f"an effect of this magnitude by chance is very "
+                f"small. Hence, the causal effect can be "
+                f"considered statistically significant."
             )
         else:
             lines.append(
-                f"This effect is not statistically significant (p = {results.p_value:.4f}). "
-                f"The apparent effect could be the result of random fluctuations "
-                f"that are not related to the intervention. This is often the case "
-                f"when the intervention effect is small relative to the noise level."
+                f"This effect is not statistically significant "
+                f"(p = {p:.4f}). The apparent effect could be "
+                f"the result of random fluctuations that are "
+                f"not related to the intervention. This is "
+                f"often the case when the intervention effect "
+                f"is small relative to the noise level."
             )
 
         return "\n".join(lines)

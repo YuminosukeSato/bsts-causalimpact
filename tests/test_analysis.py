@@ -1,8 +1,6 @@
 """Tests for CausalAnalysis: effect computation, CI, p-values."""
 
 import numpy as np
-import pytest
-
 from causal_impact.analysis import CausalAnalysis, CausalImpactResults
 
 
