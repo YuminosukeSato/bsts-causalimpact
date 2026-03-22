@@ -1,6 +1,8 @@
 use crate::distributions::{sample_inv_gamma, sample_mvnormal, sample_normal};
-use crate::kalman::{dynamic_beta_smoother, simulation_smoother};
-use crate::state_space::{SeasonalConfig, StateSpaceModel};
+use crate::kalman::{
+    dynamic_beta_smoother, local_linear_trend_smoother, simulation_smoother,
+};
+use crate::state_space::{SeasonalConfig, StateModel, StateSpaceModel};
 use rand::distributions::Bernoulli;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -11,6 +13,7 @@ const STATIC_REGRESSION_EXPECTED_R2: f64 = 0.8;
 const STATIC_REGRESSION_PRIOR_DF: f64 = 50.0;
 const STATIC_REGRESSION_PRIOR_INFORMATION_WEIGHT: f64 = 0.01;
 const STATIC_REGRESSION_DIAGONAL_SHRINKAGE: f64 = 0.5;
+const LOCAL_LINEAR_TREND_SLOPE_SD_RATIO: f64 = 0.1;
 
 struct StaticRegressionPrior {
     beta_mean: Vec<f64>,
@@ -52,6 +55,7 @@ pub fn run_sampler(
     nseasons: Option<f64>,
     season_duration: Option<f64>,
     dynamic_regression: bool,
+    state_model: &str,
 ) -> Result<GibbsResult, String> {
     validate_inputs(&y, pre_end, nchains)?;
 
@@ -61,6 +65,7 @@ pub fn run_sampler(
     }
 
     let seasonal = SeasonalConfig::from_optional(nseasons, season_duration)?;
+    let state_model = StateModel::from_name(state_model)?;
     let model = StateSpaceModel::new(y.clone(), x, seasonal);
     let n_samples = niter * nchains;
     let chain_results: Vec<ChainResult> = (0..nchains)
@@ -77,6 +82,7 @@ pub fn run_sampler(
                 chain_id,
                 expected_model_size,
                 dynamic_regression,
+                state_model,
             )
         })
         .collect();
@@ -119,6 +125,7 @@ fn run_single_chain(
     chain_id: usize,
     expected_model_size: f64,
     dynamic_regression: bool,
+    state_model: StateModel,
 ) -> ChainResult {
     if dynamic_regression {
         run_single_chain_dynamic(
@@ -130,6 +137,7 @@ fn run_single_chain(
             seed,
             prior_level_sd,
             chain_id,
+            state_model,
         )
     } else {
         run_single_chain_static(
@@ -142,6 +150,7 @@ fn run_single_chain(
             prior_level_sd,
             chain_id,
             expected_model_size,
+            state_model,
         )
     }
 }
@@ -158,6 +167,7 @@ fn run_single_chain_dynamic(
     seed: u64,
     prior_level_sd: f64,
     chain_id: usize,
+    state_model: StateModel,
 ) -> ChainResult {
     let t_total = y.len();
     let k = model.num_covariates();
@@ -169,6 +179,7 @@ fn run_single_chain_dynamic(
     let mut rng = StdRng::seed_from_u64(chain_seed);
     let mut sigma2_obs = 1.0;
     let mut sigma2_level = (prior_level_sd * prior_level_sd).max(1e-6);
+    let sigma2_slope = sample_sigma2_slope(prior_level_sd, y_sd);
     let mut seasonal_beta = vec![0.0; k_seasonal];
 
     // Dynamic regression state variables
@@ -195,13 +206,15 @@ fn run_single_chain_dynamic(
     for iter in 0..(niter + nwarmup) {
         // Step 1: State sampling — subtract time-varying x'β_t from y
         let y_adj = adjusted_observations_dynamic(y, model, &beta_t, &seasonal_beta, pre_end);
-        let states = simulation_smoother(
+        let (states, slopes) = sample_state_path(
             &mut rng,
             &y_adj,
             sigma2_obs,
             sigma2_level,
+            sigma2_slope,
             y[0],
             y_sd * y_sd,
+            state_model,
         );
 
         // Step 2: Dynamic β_t sampling via multivariate FFBS
@@ -251,7 +264,15 @@ fn run_single_chain_dynamic(
         sigma2_obs = sample_inv_gamma(&mut rng, obs_shape, obs_scale).max(1e-12);
 
         // Step 4: σ²_level sampling (same as static)
-        sigma2_level = sample_sigma2_level(&mut rng, &states, pre_end, prior_level_sd, y_sd);
+        sigma2_level = sample_sigma2_level_by_state_model(
+            &mut rng,
+            &states,
+            &slopes,
+            pre_end,
+            prior_level_sd,
+            y_sd,
+            state_model,
+        );
 
         // Step 5: σ²_β sampling per covariate (InvGamma posterior)
         if k > 0 {
@@ -297,11 +318,14 @@ fn run_single_chain_dynamic(
         }
 
         if iter >= nwarmup {
-            let states_post = sample_post_period_states(
+            let states_post = sample_post_period_states_by_state_model(
                 &mut rng,
                 states[pre_end - 1],
+                slopes[pre_end - 1],
                 t_total - pre_end,
                 sigma2_level,
+                sigma2_slope,
+                state_model,
             );
             let full_states = combine_state_paths(&states, &states_post);
 
@@ -350,6 +374,7 @@ fn run_single_chain_static(
     prior_level_sd: f64,
     chain_id: usize,
     expected_model_size: f64,
+    state_model: StateModel,
 ) -> ChainResult {
     let t_total = y.len();
     let k = model.num_covariates();
@@ -363,6 +388,7 @@ fn run_single_chain_static(
     let mut rng = StdRng::seed_from_u64(chain_seed);
     let mut sigma2_obs = 1.0;
     let mut sigma2_level = (prior_level_sd * prior_level_sd).max(1e-6);
+    let sigma2_slope = sample_sigma2_slope(prior_level_sd, y_sd);
     let mut beta = vec![0.0; k];
     let mut seasonal_beta = vec![0.0; k_seasonal];
     let mut gamma = vec![true; k];
@@ -393,13 +419,15 @@ fn run_single_chain_static(
     for iter in 0..(niter + nwarmup) {
         // Step 1: State sampling (simulation smoother)
         let y_adj = adjusted_observations(y, model, &beta, &seasonal_beta, pre_end);
-        let states = simulation_smoother(
+        let (states, slopes) = sample_state_path(
             &mut rng,
             &y_adj,
             sigma2_obs,
             sigma2_level,
+            sigma2_slope,
             y[0],
             y_sd * y_sd,
+            state_model,
         );
 
         // Step 2-3: (sigma2_obs, gamma, beta) sampling
@@ -530,14 +558,25 @@ fn run_single_chain_static(
         }
 
         // Step 4: sigma^2_level sampling
-        sigma2_level = sample_sigma2_level(&mut rng, &states, pre_end, prior_level_sd, y_sd);
+        sigma2_level = sample_sigma2_level_by_state_model(
+            &mut rng,
+            &states,
+            &slopes,
+            pre_end,
+            prior_level_sd,
+            y_sd,
+            state_model,
+        );
 
         if iter >= nwarmup {
-            let states_post = sample_post_period_states(
+            let states_post = sample_post_period_states_by_state_model(
                 &mut rng,
                 states[pre_end - 1],
+                slopes[pre_end - 1],
                 t_total - pre_end,
                 sigma2_level,
+                sigma2_slope,
+                state_model,
             );
             let full_states = combine_state_paths(&states, &states_post);
             let predictions = generate_predictions(
@@ -586,6 +625,81 @@ fn flatten_chain_results(mut chain_results: Vec<ChainResult>, n_samples: usize) 
     }
 
     result
+}
+
+fn sample_state_path<R: rand::Rng>(
+    rng: &mut R,
+    y_adj: &[f64],
+    sigma2_obs: f64,
+    sigma2_level: f64,
+    sigma2_slope: f64,
+    initial_state_mean: f64,
+    initial_state_variance: f64,
+    state_model: StateModel,
+) -> (Vec<f64>, Vec<f64>) {
+    match state_model {
+        StateModel::LocalLevel => (
+            simulation_smoother(
+                rng,
+                y_adj,
+                sigma2_obs,
+                sigma2_level,
+                initial_state_mean,
+                initial_state_variance,
+            ),
+            vec![0.0; y_adj.len()],
+        ),
+        StateModel::LocalLinearTrend => local_linear_trend_smoother(
+            rng,
+            y_adj,
+            sigma2_obs,
+            sigma2_level,
+            sigma2_slope,
+            initial_state_mean,
+            initial_state_variance,
+        ),
+    }
+}
+
+fn sample_sigma2_level_by_state_model<R: rand::Rng>(
+    rng: &mut R,
+    states: &[f64],
+    slopes: &[f64],
+    pre_end: usize,
+    prior_level_sd: f64,
+    y_sd: f64,
+    state_model: StateModel,
+) -> f64 {
+    match state_model {
+        StateModel::LocalLevel => sample_sigma2_level(rng, states, pre_end, prior_level_sd, y_sd),
+        StateModel::LocalLinearTrend => {
+            sample_sigma2_trend_level(rng, states, slopes, pre_end, prior_level_sd, y_sd)
+        }
+    }
+}
+
+fn sample_post_period_states_by_state_model<R: rand::Rng>(
+    rng: &mut R,
+    last_pre_state: f64,
+    last_pre_slope: f64,
+    post_len: usize,
+    sigma2_level: f64,
+    sigma2_slope: f64,
+    state_model: StateModel,
+) -> Vec<f64> {
+    match state_model {
+        StateModel::LocalLevel => {
+            sample_post_period_states(rng, last_pre_state, post_len, sigma2_level)
+        }
+        StateModel::LocalLinearTrend => sample_post_period_trend_states(
+            rng,
+            last_pre_state,
+            last_pre_slope,
+            post_len,
+            sigma2_level,
+            sigma2_slope,
+        ),
+    }
 }
 
 fn adjusted_observations(
@@ -882,6 +996,37 @@ fn sample_sigma2_level<R: rand::Rng>(
     sample_inv_gamma(rng, shape, scale).max(1e-12)
 }
 
+fn sample_sigma2_trend_level<R: rand::Rng>(
+    rng: &mut R,
+    states: &[f64],
+    slopes: &[f64],
+    pre_end: usize,
+    prior_level_sd: f64,
+    y_sd: f64,
+) -> f64 {
+    let sigma_guess = prior_level_sd * y_sd;
+    let sample_size = 32.0;
+    let a_prior = sample_size / 2.0;
+    let b_prior = a_prior * sigma_guess * sigma_guess;
+    let ssd = states[..pre_end]
+        .windows(2)
+        .zip(slopes[..pre_end.saturating_sub(1)].iter())
+        .map(|(window, slope)| {
+            let innovation = window[1] - window[0] - slope;
+            innovation * innovation
+        })
+        .sum::<f64>();
+
+    let shape = a_prior + (pre_end - 1) as f64 / 2.0;
+    let scale = b_prior + ssd / 2.0;
+    sample_inv_gamma(rng, shape, scale).max(1e-12)
+}
+
+fn sample_sigma2_slope(prior_level_sd: f64, y_sd: f64) -> f64 {
+    let slope_sd = (prior_level_sd * y_sd * LOCAL_LINEAR_TREND_SLOPE_SD_RATIO).max(1e-6);
+    slope_sd * slope_sd
+}
+
 fn sample_standard_deviation(values: &[f64]) -> f64 {
     if values.len() <= 1 {
         return 1.0;
@@ -969,6 +1114,26 @@ fn sample_post_period_states<R: rand::Rng>(
     (0..post_len)
         .map(|_| {
             current_state += sample_normal(rng, 0.0, sigma2_level);
+            current_state
+        })
+        .collect()
+}
+
+fn sample_post_period_trend_states<R: rand::Rng>(
+    rng: &mut R,
+    last_pre_state: f64,
+    last_pre_slope: f64,
+    post_len: usize,
+    sigma2_level: f64,
+    sigma2_slope: f64,
+) -> Vec<f64> {
+    let mut current_state = last_pre_state;
+    let mut current_slope = last_pre_slope;
+
+    (0..post_len)
+        .map(|_| {
+            current_state += current_slope + sample_normal(rng, 0.0, sigma2_level);
+            current_slope += sample_normal(rng, 0.0, sigma2_slope);
             current_state
         })
         .collect()
@@ -1114,8 +1279,22 @@ mod tests {
     #[test]
     fn test_run_sampler_basic() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
-        let result =
-            run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, false).unwrap();
+        let result = run_sampler(
+            y,
+            vec![],
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+            "local_level",
+        )
+        .unwrap();
         assert_eq!(result.states.len(), 10);
         assert_eq!(result.sigma_obs.len(), 10);
         assert_eq!(result.predictions.len(), 10);
@@ -1127,8 +1306,22 @@ mod tests {
     fn test_run_sampler_with_covariates() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
-        let result =
-            run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, false).unwrap();
+        let result = run_sampler(
+            y,
+            vec![x1],
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+            "local_level",
+        )
+        .unwrap();
         assert_eq!(result.beta.len(), 10);
         assert_eq!(result.beta[0].len(), 1);
         assert_eq!(result.gamma.len(), 10);
@@ -1150,6 +1343,7 @@ mod tests {
             None,
             None,
             false,
+            "local_level",
         );
         assert!(result.is_err());
     }
@@ -1157,7 +1351,21 @@ mod tests {
     #[test]
     fn test_run_sampler_pre_end_equals_t() {
         let y: Vec<f64> = vec![1.0, 2.0, 3.0];
-        let result = run_sampler(y, vec![], 3, 10, 5, 1, 42, 0.01, 1.0, None, None, false);
+        let result = run_sampler(
+            y,
+            vec![],
+            3,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+            "local_level",
+        );
         assert!(result.is_err());
     }
 
@@ -1179,10 +1387,25 @@ mod tests {
             None,
             None,
             false,
+            "local_level",
         );
         assert!(result.is_err());
         // k>0 with negative should fail
-        let result = run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, -1.0, None, None, false);
+        let result = run_sampler(
+            y,
+            vec![x1],
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            -1.0,
+            None,
+            None,
+            false,
+            "local_level",
+        );
         assert!(result.is_err());
     }
 
@@ -1237,8 +1460,22 @@ mod tests {
     fn test_run_sampler_dynamic_regression_basic() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
-        let result =
-            run_sampler(y, vec![x1], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, true).unwrap();
+        let result = run_sampler(
+            y,
+            vec![x1],
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            true,
+            "local_level",
+        )
+        .unwrap();
         assert_eq!(result.predictions.len(), 10);
         assert_eq!(result.predictions[0].len(), 5);
         // gamma should be empty (spike-and-slab disabled)
@@ -1261,10 +1498,25 @@ mod tests {
             None,
             None,
             true,
+            "local_level",
         )
         .unwrap();
-        let result_static =
-            run_sampler(y, vec![], 15, 10, 5, 1, 42, 0.01, 1.0, None, None, false).unwrap();
+        let result_static = run_sampler(
+            y,
+            vec![],
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+            "local_level",
+        )
+        .unwrap();
         // With k=0, both paths should produce identical predictions
         assert_eq!(
             result_dyn.predictions.len(),
@@ -1276,12 +1528,50 @@ mod tests {
     fn test_run_sampler_dynamic_regression_predictions_finite() {
         let y: Vec<f64> = (0..30).map(|i| 5.0 + (i as f64 * 0.1).sin()).collect();
         let x1: Vec<f64> = (0..30).map(|i| (i as f64 * 0.2).cos()).collect();
-        let result =
-            run_sampler(y, vec![x1], 20, 20, 10, 1, 42, 0.01, 1.0, None, None, true).unwrap();
+        let result = run_sampler(
+            y,
+            vec![x1],
+            20,
+            20,
+            10,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            true,
+            "local_level",
+        )
+        .unwrap();
         for pred_row in &result.predictions {
             for &val in pred_row {
                 assert!(val.is_finite(), "Non-finite prediction: {}", val);
             }
         }
+    }
+
+    #[test]
+    fn test_run_sampler_local_linear_trend_predictions_follow_post_period_length() {
+        let y: Vec<f64> = (0..24).map(|i| 10.0 + 0.3 * i as f64).collect();
+        let result = run_sampler(
+            y,
+            vec![],
+            18,
+            20,
+            10,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+            "local_linear_trend",
+        )
+        .unwrap();
+
+        assert_eq!(result.predictions.len(), 20);
+        assert_eq!(result.predictions[0].len(), 6);
     }
 }

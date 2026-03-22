@@ -21,7 +21,8 @@ class TestModelOptionsDefaults:
         assert opts.seed == 0
         assert opts.standardize_data is True
         assert opts.prior_level_sd == 0.01
-        assert opts.expected_model_size == 1
+        assert opts.expected_model_size == 2
+        assert opts.state_model == "local_level"
 
     def test_all_explicit(self):
         opts = ModelOptions(
@@ -32,6 +33,7 @@ class TestModelOptionsDefaults:
             standardize_data=False,
             prior_level_sd=0.1,
             expected_model_size=3,
+            state_model="local_linear_trend",
         )
         assert opts.niter == 2000
         assert opts.nwarmup == 1000
@@ -40,6 +42,7 @@ class TestModelOptionsDefaults:
         assert opts.standardize_data is False
         assert opts.prior_level_sd == 0.1
         assert opts.expected_model_size == 3
+        assert opts.state_model == "local_linear_trend"
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +145,20 @@ class TestExpectedModelSizeBoundary:
             ModelOptions(expected_model_size=-1.0)
 
 
+class TestStateModelBoundary:
+    def test_state_model_local_level_is_valid(self):
+        opts = ModelOptions(state_model="local_level")
+        assert opts.state_model == "local_level"
+
+    def test_state_model_local_linear_trend_is_valid(self):
+        opts = ModelOptions(state_model="local_linear_trend")
+        assert opts.state_model == "local_linear_trend"
+
+    def test_state_model_invalid_value_raises(self):
+        with pytest.raises(ValueError, match="state_model"):
+            ModelOptions(state_model="trend")
+
+
 # ---------------------------------------------------------------------------
 # Boundary: seasonal options
 # ---------------------------------------------------------------------------
@@ -214,6 +231,7 @@ class TestToDict:
             "prior_level_sd",
             "expected_model_size",
             "dynamic_regression",
+            "state_model",
             "nseasons",
             "season_duration",
         }

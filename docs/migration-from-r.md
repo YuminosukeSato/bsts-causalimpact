@@ -43,7 +43,7 @@ fig = ci.plot()
 | `season.duration` | `season_duration` or `model_args["season.duration"]` | `1` when `nseasons` is set |
 | `prior.level.sd` | `prior_level_sd` | 0.01 |
 | `standardize.data` | `standardize_data` | True |
-| `expected.model.size` | `expected_model_size` | 2 in `CausalImpact`; `ModelOptions` keeps 1 |
+| `expected.model.size` | `expected_model_size` | 2 |
 
 ## Data Format
 
@@ -85,9 +85,11 @@ This library verifies ±3% agreement with R CausalImpact on point estimates and 
 
 Differences arise from independent RNG implementations (R's `set.seed` vs Rust's `ChaCha8Rng`), not from algorithmic differences.
 
+Use `model_args={"state_model": "local_linear_trend"}` when you want the
+optional local linear trend state instead of the default local level model.
+
 ## What Is Not Supported
 
 - Custom bsts model objects
-- `model.args$dynamic.regression`
 
 These features may be added in future versions.

@@ -46,16 +46,26 @@ class TestEndToEnd:
         assert isinstance(inferences, pd.DataFrame)
         assert len(inferences) > 0
         assert list(inferences.columns) == [
+            "actual",
+            "predicted_mean",
+            "predicted_lower",
+            "predicted_upper",
+            "predictions_sd",
             "point_effect",
             "point_effect_lower",
             "point_effect_upper",
             "cumulative_effect",
             "cumulative_effect_lower",
             "cumulative_effect_upper",
-            "predicted_mean",
-            "predicted_lower",
-            "predicted_upper",
         ]
+        np.testing.assert_allclose(
+            inferences["actual"].to_numpy(),
+            df.loc[post_period[0] : post_period[1], "y"].to_numpy(),
+        )
+        np.testing.assert_allclose(
+            inferences["predictions_sd"].to_numpy(),
+            ci._results.predictions_sd,
+        )
 
         stats = ci.summary_stats
         assert isinstance(stats, dict)
@@ -143,6 +153,76 @@ class TestEndToEnd:
         )
 
         assert abs(ci.summary_stats["point_effect_mean"] - 4.0) < 1.0
+
+    def test_local_linear_trend_recovers_linear_drift_better_than_local_level(
+        self,
+    ):
+        rng = np.random.default_rng(77)
+        n = 120
+        pre_end = 90
+        post_len = n - pre_end
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        baseline = 10.0 + 0.15 * np.arange(n)
+        y = baseline + rng.normal(0.0, 0.1, n)
+        y[pre_end:] += 2.5
+        df = pd.DataFrame({"y": y}, index=dates)
+        pre_period = [str(dates[0].date()), str(dates[pre_end - 1].date())]
+        post_period = [str(dates[pre_end].date()), str(dates[-1].date())]
+
+        ci_local_level = CausalImpact(
+            df,
+            pre_period,
+            post_period,
+            model_args={"niter": 300, "nwarmup": 150, "seed": 77},
+        )
+        ci_local_linear_trend = CausalImpact(
+            df,
+            pre_period,
+            post_period,
+            model_args={
+                "niter": 300,
+                "nwarmup": 150,
+                "seed": 77,
+                "state_model": "local_linear_trend",
+            },
+        )
+
+        level_error = abs(ci_local_level.summary_stats["point_effect_mean"] - 2.5)
+        trend_error = abs(
+            ci_local_linear_trend.summary_stats["point_effect_mean"] - 2.5
+        )
+
+        assert len(ci_local_linear_trend.inferences) == post_len
+        assert trend_error < level_error
+
+    def test_local_linear_trend_and_dynamic_regression_can_be_enabled_together(
+        self,
+    ):
+        rng = np.random.default_rng(99)
+        n = 80
+        pre_end = 56
+        dates = pd.date_range("2020-01-01", periods=n, freq="D")
+        x = rng.normal(0, 1, n)
+        baseline = 5.0 + 0.1 * np.arange(n)
+        y = baseline + 1.3 * x + rng.normal(0.0, 0.1, n)
+        y[pre_end:] += 1.5
+        df = pd.DataFrame({"y": y, "x1": x}, index=dates)
+
+        ci = CausalImpact(
+            df,
+            [str(dates[0].date()), str(dates[pre_end - 1].date())],
+            [str(dates[pre_end].date()), str(dates[-1].date())],
+            model_args={
+                "niter": 200,
+                "nwarmup": 100,
+                "seed": 99,
+                "dynamic_regression": True,
+                "state_model": "local_linear_trend",
+            },
+        )
+
+        assert np.isfinite(ci.summary_stats["point_effect_mean"])
+        assert ci.inferences["predictions_sd"].ge(0).all()
 
 
 class TestSpikeSlabIntegration:

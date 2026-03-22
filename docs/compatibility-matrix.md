@@ -7,9 +7,9 @@ Comparison of features between R CausalImpact (bsts 1.4.1) and this Python imple
 | Feature | R | Python | Notes |
 |---|---|---|---|
 | Local level | Yes | Yes | Identical algorithm |
-| Local linear trend | Yes | No | Not yet implemented |
+| Local linear trend | Yes | Yes | `state_model="local_linear_trend"` |
 | Seasonality | Yes | Yes | R-compatible API with seasonal fixture coverage |
-| Dynamic regression | Yes | No | Not yet implemented |
+| Dynamic regression | Yes | Yes | `dynamic_regression=True` |
 | Regression (static) | Yes | Yes | Identical algorithm |
 
 ## MCMC Parameters
@@ -21,7 +21,8 @@ Comparison of features between R CausalImpact (bsts 1.4.1) and this Python imple
 | season.duration | Yes | Yes | `ModelOptions.season_duration` or `model_args["season.duration"]` |
 | prior.level.sd | Yes | Yes | Same default (0.01) |
 | standardize.data | Yes | Yes | Same default (True) |
-| expected.model.size | Yes | Yes | Legacy `CausalImpact` default is 2; `ModelOptions` keeps 1 |
+| expected.model.size | Yes | Yes | Unified default `2` |
+| state model selection | Via bsts state spec | Yes | `state_model="local_level"` or `"local_linear_trend"` |
 
 ## Warmup Semantics
 

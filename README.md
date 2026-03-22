@@ -17,7 +17,9 @@ If any of these assumptions are violated, the causal estimate will be unreliable
 
 ## Installation
 
-Requires Python 3.10+ and a Rust toolchain.
+Requires Python 3.10+.
+Binary wheels are intended for supported platforms, so Rust is only required
+when building from source.
 
 ```bash
 pip install bsts-causalimpact
@@ -113,12 +115,12 @@ Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
 | Post-period Random Walk propagation | Matching | Forward simulation from last pre-period state |
 | Data standardization (standardize.data=TRUE) | Matching | (y - mean) / sd using pre-period moments |
 | prior.level.sd = 0.01 | Matching | Same default, same semantics |
-| Spike-and-slab variable selection | Partial | Coordinate-wise sampling works; prior parameters (expected.r2, prior.df) are approximate |
-| expected.model.size | Partial | `CausalImpact` preserves the legacy default `2`; `ModelOptions` keeps explicit default `1` |
-| expected.r2 = 0.8, prior.df = 50 | Partial | Static regression prior is tuned for close R parity, not a byte-for-byte port |
+| Spike-and-slab variable selection | Matching | Coordinate-wise sampling with StudentSpikeSlabPrior defaults (`expected.r2=0.8`, `prior.df=50`, `prior.information.weight=0.01`, `diagonal.shrinkage=0.5`) |
+| expected.model.size | Matching | Unified default `2` in `CausalImpact` and `ModelOptions` |
+| expected.r2 = 0.8, prior.df = 50 | Matching | Same documented residual variance prior defaults as BoomSpikeSlab / bsts |
 | Seasonal component (`nseasons`, `season_duration`) | Supported | R-compatible API with seasonal fixture coverage |
 | Dynamic regression | Supported | Time-varying coefficients via random-walk FFBS; `dynamic_regression=True` |
-| Local linear trend | Planned | R uses AddLocalLevel only by default; trend option exists but not ported |
+| Local linear trend | Supported | Opt in with `state_model="local_linear_trend"` |
 
 Covariate CI bounds are enforced twice: the legacy parity fixture remains tighter than
 Phase 2 requirements, and a separate Phase 2 acceptance test keeps the threshold at `±3%`.
@@ -145,10 +147,11 @@ Phase 2 requirements, and a separate Phase 2 acceptance test keeps the threshold
 | `seed` | 0 | Random seed for reproducibility |
 | `prior_level_sd` | 0.01 | Prior standard deviation for the local level |
 | `standardize_data` | `True` | Standardize data before fitting |
-| `expected_model_size` | 2 | Expected number of active covariates (spike-and-slab prior); `ModelOptions` keeps `1` |
+| `expected_model_size` | 2 | Expected number of active covariates (spike-and-slab prior) |
 | `nseasons` | `None` | Optional seasonal cycle count (R-compatible API) |
 | `season_duration` | `None` | Optional duration of each seasonal block; defaults to `1` when `nseasons` is set |
 | `dynamic_regression` | `False` | Enable time-varying regression coefficients (random-walk beta) |
+| `state_model` | `"local_level"` | `"local_level"` or `"local_linear_trend"` |
 
 #### Methods and Properties
 
@@ -157,7 +160,7 @@ Phase 2 requirements, and a separate Phase 2 acceptance test keeps the threshold
 | `summary(output="summary")` | `str` | Tabular summary of causal effects |
 | `report()` | `str` | Narrative interpretation of results |
 | `plot(metrics=None)` | `Figure` | Matplotlib figure with original/pointwise/cumulative panels |
-| `inferences` | `DataFrame` | Per-timestep effects, predictions, and credible intervals |
+| `inferences` | `DataFrame` | Per-timestep actuals, predictions, prediction s.d., and effect intervals |
 | `summary_stats` | `dict` | Aggregate statistics (effect mean, CI, p-value, etc.) |
 | `posterior_inclusion_probs` | `ndarray \| None` | Posterior inclusion probability per covariate |
 

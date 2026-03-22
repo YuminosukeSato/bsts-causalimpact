@@ -37,7 +37,8 @@ pub struct GibbsSamples {
         expected_model_size=1.0,
         nseasons=None,
         season_duration=None,
-        dynamic_regression=false
+        dynamic_regression=false,
+        state_model="local_level"
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -54,6 +55,7 @@ fn run_gibbs_sampler(
     nseasons: Option<f64>,
     season_duration: Option<f64>,
     dynamic_regression: bool,
+    state_model: &str,
 ) -> PyResult<GibbsSamples> {
     let x_vecs: Vec<Vec<f64>> = match x {
         Some(list) => {
@@ -80,6 +82,7 @@ fn run_gibbs_sampler(
         nseasons,
         season_duration,
         dynamic_regression,
+        state_model,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
@@ -97,7 +100,7 @@ fn run_gibbs_sampler(
 /// Provides Gibbs sampler for Bayesian structural time series.
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.3.0")?;
+    m.add("__version__", "1.0.0")?;
     m.add_class::<GibbsSamples>()?;
     m.add_function(wrap_pyfunction!(run_gibbs_sampler, m)?)?;
     Ok(())

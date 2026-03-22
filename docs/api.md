@@ -30,7 +30,7 @@ ci = CausalImpact(data, pre_period, post_period, model_args=None, alpha=0.05)
 
 | Property | Type | Description |
 |---|---|---|
-| `inferences` | `DataFrame` | Per-timestep effects, predictions, and credible intervals |
+| `inferences` | `DataFrame` | Per-timestep actuals, predictions, prediction s.d., and effect intervals |
 | `summary_stats` | `dict` | Aggregate statistics (effect mean, CI, p-value, etc.) |
 | `posterior_inclusion_probs` | `ndarray \| None` | Posterior inclusion probability per covariate (requires covariates) |
 
@@ -53,14 +53,11 @@ ci = CausalImpact(data, pre_period, post_period, model_args=opts)
 | `seed` | `int` | 0 | Random seed for reproducibility |
 | `prior_level_sd` | `float` | 0.01 | Prior standard deviation for the local level |
 | `standardize_data` | `bool` | `True` | Standardize data before fitting |
-| `expected_model_size` | `int` | 1 | Expected number of active covariates for spike-and-slab prior |
+| `expected_model_size` | `int` | 2 | Expected number of active covariates for spike-and-slab prior |
+| `dynamic_regression` | `bool` | `False` | Enable time-varying regression coefficients |
+| `state_model` | `str` | `"local_level"` | `"local_level"` or `"local_linear_trend"` |
 | `nseasons` | `int \| None` | `None` | Seasonal cycle count |
 | `season_duration` | `int \| None` | `None` | Duration of each seasonal block; defaults to 1 when `nseasons` is set |
-
-!!! note "expected_model_size defaults"
-    `CausalImpact` sets `expected_model_size=2` by default (matching R).
-    `ModelOptions` keeps `expected_model_size=1` as the explicit default.
-    When passing a `ModelOptions` instance, the `ModelOptions` value takes precedence.
 
 ## `CausalImpactResults`
 
@@ -72,8 +69,8 @@ Returned by `ci._results`. A frozen dataclass containing all computed quantities
 |---|---|---|
 | `actual` | `ndarray` | Observed y values in the post period |
 | `point_effects` | `ndarray` | Mean effect per time point |
-| `point_effect_lower` | `ndarray` | Lower 95% CI per time point |
-| `point_effect_upper` | `ndarray` | Upper 95% CI per time point |
+| `point_effect_lower` | `ndarray` | Lower pointwise credible interval per time point |
+| `point_effect_upper` | `ndarray` | Upper pointwise credible interval per time point |
 | `point_effect_mean` | `float` | Mean of point effects across time |
 | `ci_lower` | `float` | Lower CI bound on average effect |
 | `ci_upper` | `float` | Upper CI bound on average effect |
@@ -81,5 +78,6 @@ Returned by `ci._results`. A frozen dataclass containing all computed quantities
 | `relative_effect_mean` | `float` | Relative effect (effect / predicted) |
 | `p_value` | `float` | Bayesian one-sided tail probability |
 | `predictions_mean` | `ndarray` | Mean counterfactual prediction |
+| `predictions_sd` | `ndarray` | Posterior standard deviation of the counterfactual prediction |
 | `predictions_lower` | `ndarray` | Lower CI on counterfactual |
 | `predictions_upper` | `ndarray` | Upper CI on counterfactual |
