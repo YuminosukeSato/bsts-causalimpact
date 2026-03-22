@@ -6,7 +6,6 @@ from causal_impact.plot import Plotter
 
 
 def _make_results_with_index():
-    """Create results and time index for plotting."""
     import pandas as pd
 
     t_pre = 70
@@ -16,28 +15,39 @@ def _make_results_with_index():
     y = np.random.default_rng(42).normal(10, 1, t_total)
     time_index = pd.date_range("2020-01-01", periods=t_total, freq="D")
     results = CausalImpactResults(
+        actual=np.full(t_post, 12.0),
         point_effects=np.full(t_post, 2.0),
         point_effect_lower=np.full(t_post, 1.5),
         point_effect_upper=np.full(t_post, 2.5),
         ci_lower=1.0,
         ci_upper=3.0,
         point_effect_mean=2.0,
+        average_effect_sd=0.2,
         cumulative_effect=np.cumsum(np.full(t_post, 2.0)),
         cumulative_effect_lower=np.cumsum(np.full(t_post, 1.5)),
         cumulative_effect_upper=np.cumsum(np.full(t_post, 2.5)),
         cumulative_effect_total=60.0,
+        cumulative_effect_sd=6.0,
         relative_effect_mean=0.2,
+        relative_effect_sd=0.02,
+        relative_effect_lower=0.1,
+        relative_effect_upper=0.3,
         p_value=0.01,
         predictions_mean=np.full(t_post, 10.0),
+        predictions_sd=np.full(t_post, 0.5),
         predictions_lower=np.full(t_post, 9.0),
         predictions_upper=np.full(t_post, 11.0),
+        average_prediction_sd=0.5,
+        average_prediction_lower=9.0,
+        average_prediction_upper=11.0,
+        cumulative_prediction_sd=15.0,
+        cumulative_prediction_lower=270.0,
+        cumulative_prediction_upper=330.0,
     )
     return results, y, time_index, t_pre
 
 
 class TestPlot:
-    """Plotのテスト."""
-
     def test_plot_3_panels(self):
         import matplotlib
 
@@ -62,11 +72,9 @@ class TestPlot:
         matplotlib.use("Agg")
         results, y, time_index, t_pre = _make_results_with_index()
         fig = Plotter.plot(results, y, time_index, t_pre)
-        # Check that vertical lines exist in each subplot
         axes = fig.get_axes()
         for ax in axes:
             lines = ax.get_lines()
-            # At least the intervention vertical line should be present
             assert len(lines) >= 1
 
     def test_plot_pointwise_panel_draws_ci_band(self):
