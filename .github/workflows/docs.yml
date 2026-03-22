@@ -1,0 +1,52 @@
+name: Deploy Docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - ".github/workflows/docs.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install uv
+          uv sync --all-extras
+
+      - name: Generate docs assets
+        run: .venv/bin/python scripts/generate_docs_assets.py
+
+      - name: Verify generated assets
+        run: |
+          test -f docs/images/causal_impact_plot.png
+          echo "PNG asset verified."
+
+      - name: Build docs (strict mode)
+        run: .venv/bin/mkdocs build --strict
+
+      - name: Verify HTML output
+        run: |
+          grep -q "Getting Started" site/index.html
+          echo "HTML content verified."
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        run: .venv/bin/mkdocs gh-deploy --force

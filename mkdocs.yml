@@ -1,0 +1,34 @@
+site_name: bsts-causalimpact
+site_url: https://yuminosukesato.github.io/bsts-causalimpact/
+repo_url: https://github.com/YuminosukeSato/bsts-causalimpact
+repo_name: YuminosukeSato/bsts-causalimpact
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+  features:
+    - navigation.tabs
+    - content.code.copy
+
+nav:
+  - Getting Started: index.md
+  - API Reference: api.md
+  - Migration from R: migration-from-r.md
+  - Migration from tfp: migration-from-tfp.md
+  - Compatibility Matrix: compatibility-matrix.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - admonition
+  - pymdownx.details
+  - tables

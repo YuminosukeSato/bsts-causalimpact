@@ -19,6 +19,10 @@ dev = [
     "pytest-cov",
     "ruff",
 ]
+docs = [
+    "mkdocs-material>=9.0",
+    "pymdown-extensions>=10.0",
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

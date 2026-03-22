@@ -11,3 +11,5 @@ build/
 z-ai/
 .claude/
 *.DS_Store
+site/
+docs/images/*.png
