@@ -16,21 +16,34 @@ def _make_results_with_index():
     y = np.random.default_rng(42).normal(10, 1, t_total)
     time_index = pd.date_range("2020-01-01", periods=t_total, freq="D")
     results = CausalImpactResults(
+        actual=np.full(t_post, 12.0),
         point_effects=np.full(t_post, 2.0),
         point_effect_lower=np.full(t_post, 1.5),
         point_effect_upper=np.full(t_post, 2.5),
         ci_lower=1.0,
         ci_upper=3.0,
         point_effect_mean=2.0,
+        average_effect_sd=0.2,
         cumulative_effect=np.cumsum(np.full(t_post, 2.0)),
         cumulative_effect_lower=np.cumsum(np.full(t_post, 1.5)),
         cumulative_effect_upper=np.cumsum(np.full(t_post, 2.5)),
         cumulative_effect_total=60.0,
+        cumulative_effect_sd=6.0,
         relative_effect_mean=0.2,
+        relative_effect_sd=0.02,
+        relative_effect_lower=0.1,
+        relative_effect_upper=0.3,
         p_value=0.01,
         predictions_mean=np.full(t_post, 10.0),
+        predictions_sd=np.full(t_post, 0.5),
         predictions_lower=np.full(t_post, 9.0),
         predictions_upper=np.full(t_post, 11.0),
+        average_prediction_sd=0.5,
+        average_prediction_lower=9.0,
+        average_prediction_upper=11.0,
+        cumulative_prediction_sd=15.0,
+        cumulative_prediction_lower=270.0,
+        cumulative_prediction_upper=330.0,
     )
     return results, y, time_index, t_pre
 

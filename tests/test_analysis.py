@@ -107,6 +107,54 @@ class TestCumulativeAndRelative:
         # Relative effect ≈ 2.0/10.0 = 20%
         assert abs(result.relative_effect_mean - 0.2) < 0.1
 
+    def test_summary_stats_use_posterior_sample_aggregates(self):
+        """summary行はposterior sample集約値(mean/sd/CI)を保持する."""
+        y_post = np.array([10.0, 10.0])
+        predictions = np.array(
+            [
+                [8.0, 8.0],
+                [10.0, 6.0],
+                [11.0, 7.0],
+            ]
+        )
+
+        result = CausalAnalysis.compute_effects(
+            y_post=y_post,
+            predictions=predictions,
+            alpha=0.0,
+        )
+
+        assert np.array_equal(result.actual, y_post)
+        assert np.allclose(result.predictions_sd, np.std(predictions, axis=0, ddof=1))
+        assert result.average_prediction_sd == np.sqrt(1.0 / 3.0)
+        assert result.average_prediction_lower == 8.0
+        assert result.average_prediction_upper == 9.0
+        assert result.cumulative_prediction_sd == np.sqrt(4.0 / 3.0)
+        assert result.cumulative_prediction_lower == 16.0
+        assert result.cumulative_prediction_upper == 18.0
+        assert result.average_effect_sd == np.sqrt(1.0 / 3.0)
+        assert result.cumulative_effect_sd == np.sqrt(4.0 / 3.0)
+        assert result.relative_effect_lower == 1.0 / 9.0
+        assert result.relative_effect_upper == 0.25
+
+    def test_single_sample_degenerates_sd_to_zero(self):
+        """posterior sampleが1本ならs.d.はNaNではなく0に潰す."""
+        y_post = np.array([10.0, 12.0, 14.0])
+        predictions = np.array([[9.0, 11.0, 13.0]])
+
+        result = CausalAnalysis.compute_effects(
+            y_post=y_post,
+            predictions=predictions,
+            alpha=0.05,
+        )
+
+        assert np.array_equal(result.predictions_sd, np.zeros(3))
+        assert result.average_prediction_sd == 0.0
+        assert result.cumulative_prediction_sd == 0.0
+        assert result.average_effect_sd == 0.0
+        assert result.cumulative_effect_sd == 0.0
+        assert result.relative_effect_sd == 0.0
+
 
 class TestPointwiseCI:
     """各時点CI（R実装一致）テスト."""

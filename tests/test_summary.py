@@ -50,10 +50,8 @@ class TestSummaryFormat:
         assert "Cumulative" in text
         assert "2.0" in text or "2.00" in text
 
-    def test_summary_includes_r_style_actual_prediction_and_effect_sections_because_placeholder_rows_hide_valid_results(
-        self,
-    ):
-        """R互換の summary では Actual/Prediction/Absolute/Relative の各行を欠かさない."""
+    def test_summary_includes_r_style_sections(self):
+        """R互換summary: Actual/Prediction/Absolute/Relativeの各行を表示."""
         result = _make_results(effect=2.0, p_value=0.01)
 
         text = SummaryFormatter.summary(result, digits=2)
