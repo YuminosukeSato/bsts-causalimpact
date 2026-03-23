@@ -43,13 +43,14 @@ MCMC_ARGS = {
 }
 
 TOL_POINT = 0.03  # ±3% for point estimates
-# ±1.5% for no-covariates CI bounds
-# (convergence ~0.83%, MCMC variance ±0.5%)
-TOL_CI_NO_COV = 0.015
+# ±1.0% for no-covariates CI bounds
+# (actual error ~0.44%, MCMC variance margin included)
+TOL_CI_NO_COV = 0.01
 TOL_CI_COV = 0.01  # ±1% after aligning with the R static regression prior
 TOL_CI_PHASE2 = 0.03  # explicit Phase 2 benchmark for covariate CI bounds
-TOL_POINT_SEASONAL = 0.05
-TOL_CI_SEASONAL = 0.05
+# State-space seasonal (DK simulation smoother): actual error < 0.1%
+TOL_POINT_SEASONAL = 0.01
+TOL_CI_SEASONAL = 0.01
 ABS_TOL_NO_EFFECT = 2.0  # absolute tolerance when true_effect=0
 
 

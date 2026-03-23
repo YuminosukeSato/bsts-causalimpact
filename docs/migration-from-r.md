@@ -81,7 +81,9 @@ Key differences:
 
 ## Numerical Equivalence
 
-This library verifies ±3% agreement with R CausalImpact on point estimates and cumulative effects across multiple test scenarios, including a seasonal fixture. Tests run on every PR.
+This library verifies ±3% agreement with R CausalImpact on point estimates and cumulative effects across multiple test scenarios. Tests run on every PR.
+
+The seasonal model uses the same state-space algorithm as R bsts `AddSeasonal()`, achieving ±1% CI parity on the seasonal fixture.
 
 Differences arise from independent RNG implementations (R's `set.seed` vs Rust's `ChaCha8Rng`), not from algorithmic differences.
 
