@@ -668,6 +668,7 @@ fn flatten_chain_results(mut chain_results: Vec<ChainResult>, n_samples: usize) 
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_state_path<R: rand::Rng>(
     rng: &mut R,
     y_adj: &[f64],
@@ -914,9 +915,7 @@ fn sample_spike_and_slab<R: rand::Rng>(
         if n_j < 1e-12 {
             gamma[j] = false;
             beta[j] = 0.0;
-            for (t, r) in residual.iter_mut().enumerate().take(t_pre) {
-                *r -= x_col[t] * beta[j];
-            }
+            // No residual update needed: beta[j] is 0, so x_col[t] * 0 = 0
             continue;
         }
 
