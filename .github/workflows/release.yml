@@ -20,7 +20,7 @@ jobs:
             target: aarch64
           - os: macos-14
             target: aarch64
-          - os: macos-latest
+          - os: macos-13
             target: x86_64
           - os: windows-latest
             target: x64
@@ -65,7 +65,7 @@ jobs:
             target: x86_64
           - os: macos-14
             target: aarch64
-          - os: macos-latest
+          - os: macos-13
             target: x86_64
           - os: windows-latest
             target: x64
@@ -84,8 +84,9 @@ jobs:
           import subprocess
           import sys
 
-          wheels = glob.glob("dist/*.whl")
-          assert wheels, "No wheel artifact downloaded"
+          interpreter_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+          wheels = glob.glob(f"dist/*{interpreter_tag}*.whl")
+          assert wheels, f"No wheel matching interpreter tag {interpreter_tag}"
           subprocess.check_call([sys.executable, "-m", "pip", "install", wheels[0]])
       - name: Smoke test wheel
         shell: python
