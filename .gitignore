@@ -13,3 +13,4 @@ z-ai/
 .claude/
 *.DS_Store
 site/
+.cargo/
