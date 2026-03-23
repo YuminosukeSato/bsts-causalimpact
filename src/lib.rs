@@ -103,7 +103,7 @@ fn run_gibbs_sampler(
 /// Provides Gibbs sampler for Bayesian structural time series.
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "1.0.0")?;
+    m.add("__version__", "1.1.0")?;
     m.add_class::<GibbsSamples>()?;
     m.add_function(wrap_pyfunction!(run_gibbs_sampler, m)?)?;
     Ok(())

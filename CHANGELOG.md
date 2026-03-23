@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [1.1.0] - 2026-03-23
+
+### Changed
+
+- Seasonal component: migrated from dummy regression to Kalman state-space
+  model matching R bsts `AddSeasonal()` algorithm.
+- Seasonal numerical equivalence tolerance tightened from ±5% to ±1%.
+
+### Fixed
+
+- `__version__` in Rust module now correctly tracks release version.
+
 ## [1.0.0] - 2026-03-23
 
 ### Added
