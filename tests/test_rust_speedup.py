@@ -12,7 +12,6 @@ import math
 import time
 
 import numpy as np
-import pytest
 from causal_impact._core import run_gibbs_sampler
 
 
@@ -20,7 +19,7 @@ class TestSamplerOutputCorrectness:
     """Verify that Cholesky migration does not break sampler output properties."""
 
     def test_no_covariates_output_unchanged(self):
-        """k=0: no regression, output should be identical regardless of Cholesky changes."""
+        """k=0: no regression, output identical regardless of Cholesky."""
         y = [10.0 + 0.1 * i for i in range(100)]
         result = run_gibbs_sampler(
             y=y,
@@ -38,7 +37,7 @@ class TestSamplerOutputCorrectness:
             assert len(beta_row) == 0
 
     def test_single_covariate_posterior_mean_reasonable(self):
-        """k=1: single covariate, posterior beta mean should be near true coefficient."""
+        """k=1: posterior beta mean should be near true coefficient."""
         rng = np.random.RandomState(42)
         t = 200
         x1 = rng.randn(t)
@@ -60,7 +59,7 @@ class TestSamplerOutputCorrectness:
         )
 
     def test_two_covariates_posterior_means_reasonable(self):
-        """k=2: two covariates, both posterior means should be near true coefficients."""
+        """k=2: both posterior means near true coefficients."""
         rng = np.random.RandomState(123)
         t = 300
         x1 = rng.randn(t)
@@ -192,7 +191,7 @@ class TestSpikeSlab:
         )
         gamma_const = np.mean([g[0] for g in result.gamma])
         assert gamma_const == 0.0, (
-            f"Constant covariate should always be excluded, got inclusion rate {gamma_const}"
+            f"Constant covariate should be excluded, got {gamma_const}"
         )
 
 
@@ -229,7 +228,10 @@ class TestManyCovariates:
         k = 20
         x_cols = [rng.randn(t).tolist() for _ in range(k)]
         coefs = rng.randn(k)
-        y = [sum(coefs[j] * x_cols[j][i] for j in range(k)) + rng.randn() for i in range(t)]
+        y = [
+            sum(coefs[j] * x_cols[j][i] for j in range(k)) + rng.randn()
+            for i in range(t)
+        ]
         t0 = time.time()
         result = run_gibbs_sampler(
             y=y,
