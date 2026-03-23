@@ -16,6 +16,8 @@ pub struct GibbsSamples {
     #[pyo3(get)]
     pub sigma_level: Vec<f64>,
     #[pyo3(get)]
+    pub sigma_seasonal: Vec<f64>,
+    #[pyo3(get)]
     pub beta: Vec<Vec<f64>>,
     #[pyo3(get)]
     pub gamma: Vec<Vec<bool>>,
@@ -90,6 +92,7 @@ fn run_gibbs_sampler(
         states: result.states,
         sigma_obs: result.sigma_obs,
         sigma_level: result.sigma_level,
+        sigma_seasonal: result.sigma_seasonal,
         beta: result.beta,
         gamma: result.gamma,
         predictions: result.predictions,
