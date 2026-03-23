@@ -56,8 +56,8 @@ ci = CausalImpact(data, pre_period, post_period, model_args=opts)
 | `expected_model_size` | `int` | 2 | Expected number of active covariates for spike-and-slab prior |
 | `dynamic_regression` | `bool` | `False` | Enable time-varying regression coefficients |
 | `state_model` | `str` | `"local_level"` | `"local_level"` or `"local_linear_trend"` |
-| `nseasons` | `int \| None` | `None` | Seasonal cycle count |
-| `season_duration` | `int \| None` | `None` | Duration of each seasonal block; defaults to 1 when `nseasons` is set |
+| `nseasons` | `int \| None` | `None` | Seasonal cycle count. `nseasons=1` is equivalent to no seasonal component. |
+| `season_duration` | `int \| None` | `None` | Duration of each seasonal block; defaults to 1 when `nseasons` is set. Requires `nseasons` to be set. |
 
 ## `CausalImpactResults`
 

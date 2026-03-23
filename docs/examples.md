@@ -183,6 +183,38 @@ Posterior prob. of a causal effect: 99.95%
 True effect = 8.0, estimated = 7.57. The 95% CI [5.99, 9.18] contains the true
 value.
 
+### How it works
+
+The seasonal component uses a state-space model matching R bsts `AddSeasonal()`.
+The state vector is `[μ_t, s_1(t), ..., s_{S-1}(t)]` where `S = nseasons`.
+Seasonal states evolve via a sum-to-zero transition: the next season equals
+the negative sum of the previous `S-1` seasons plus noise.
+
+### Using `season_duration`
+
+Set `season_duration > 1` when each season spans multiple time steps.
+The seasonal transition only fires at season boundaries
+(`t % season_duration == 0`); in between, the seasonal state is frozen.
+
+```python
+# Using the same data from the seasonal example above
+
+# Daily data with 7-day weekly pattern (default: season_duration=1)
+ci = CausalImpact(
+    data, pre_period, post_period,
+    model_args={"nseasons": 7, "season_duration": 1, "seed": 42},
+)
+
+# Monthly data with quarterly pattern (each quarter = 3 months)
+ci = CausalImpact(
+    data, pre_period, post_period,
+    model_args={"nseasons": 4, "season_duration": 3, "seed": 42},
+)
+```
+
+When `season_duration` is omitted, it defaults to 1 (every time step is a new
+season). `nseasons=1` is equivalent to no seasonal component.
+
 ---
 
 ## 4. Dynamic Regression
