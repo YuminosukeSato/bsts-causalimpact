@@ -3092,4 +3092,52 @@ mod tests {
             }
         }
     }
+
+    // ── PR-E tests: Rayon backward pass regression ──────────────────
+
+    #[test]
+    fn test_rayon_phase2_matches_sequential_s4_t100() {
+        let y: Vec<f64> = (0..100).map(|i| (i as f64 * 0.1).sin()).collect();
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 4, 1, 1.0, 1.0, 1e-9, "rayon_s4_t100");
+    }
+
+    #[test]
+    fn test_rayon_phase2_matches_sequential_s168_t1200() {
+        let y: Vec<f64> = (0..1200)
+            .map(|i| ((i % 168) as f64 - 83.5) * 0.05)
+            .collect();
+        assert_dk_matches_rts(
+            &y,
+            0.5,
+            0.01,
+            0.01,
+            168,
+            1,
+            1.0,
+            1.0,
+            1e-3,
+            "rayon_s168_t1200",
+        );
+    }
+
+    #[test]
+    fn test_rayon_r_store_all_finite_s168_t1200() {
+        let y: Vec<f64> = (0..1200)
+            .map(|i| ((i % 168) as f64 - 83.5) * 0.05)
+            .collect();
+        let result =
+            seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 168, 1, 1.0, 1.0);
+        assert_eq!(result.len(), 1200);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "rayon finite: smooth[{}][{}] = {} not finite",
+                    i,
+                    j,
+                    val
+                );
+            }
+        }
+    }
 }
