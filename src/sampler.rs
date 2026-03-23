@@ -1,4 +1,4 @@
-use crate::distributions::{sample_inv_gamma, sample_mvnormal, sample_normal};
+use crate::distributions::{sample_from_precision, sample_inv_gamma, sample_normal};
 use crate::kalman::{dynamic_beta_smoother, local_linear_trend_smoother, simulation_smoother};
 use crate::state_space::{SeasonalConfig, StateModel, StateSpaceModel};
 use rand::distributions::Bernoulli;
@@ -201,6 +201,13 @@ fn run_single_chain_dynamic(
         predictions: Vec::with_capacity(niter),
     };
 
+    // Pre-compute X^TX for seasonal regression (constant across iterations).
+    let xtx_seasonal = if k_seasonal > 0 {
+        Some(cross_product_matrix(model.seasonal_covariates(), pre_end))
+    } else {
+        None
+    };
+
     for iter in 0..(niter + nwarmup) {
         // Step 1: State sampling — subtract time-varying x'β_t from y
         let y_adj = adjusted_observations_dynamic(y, model, &beta_t, &seasonal_beta, pre_end);
@@ -312,6 +319,7 @@ fn run_single_chain_dynamic(
                 sigma2_obs,
                 &prior.beta_mean,
                 &prior.beta_precision,
+                xtx_seasonal.as_ref(),
             );
         }
 
@@ -414,6 +422,37 @@ fn run_single_chain_static(
     };
     let g = pre_end as f64; // Zellner's g-prior parameter
 
+    // Pre-compute X^TX for static and seasonal regression.
+    // X is constant across all Gibbs iterations, so this is computed once.
+    let xtx_static = if k > 0 {
+        Some(cross_product_matrix(model.covariates(), pre_end))
+    } else {
+        None
+    };
+    let xtx_seasonal = if k_seasonal > 0 {
+        Some(cross_product_matrix(model.seasonal_covariates(), pre_end))
+    } else {
+        None
+    };
+
+    // Pre-compute spike-and-slab constant statistics per covariate.
+    // x_mean and n_j = sum((x_j - x_mean)^2) are constant across iterations.
+    let slab_stats: Vec<(f64, f64)> = if use_spike_slab {
+        model
+            .covariates()
+            .iter()
+            .map(|x_col| {
+                let x_sum: f64 = x_col.iter().take(pre_end).sum();
+                let x_mean = x_sum / pre_end as f64;
+                let sum_x2: f64 = x_col.iter().take(pre_end).map(|v| v * v).sum();
+                let n_j = sum_x2 - pre_end as f64 * x_mean * x_mean;
+                (x_mean, n_j)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
     for iter in 0..(niter + nwarmup) {
         // Step 1: State sampling (simulation smoother)
         let y_adj = adjusted_observations(y, model, &beta, &seasonal_beta, pre_end);
@@ -459,6 +498,7 @@ fn run_single_chain_static(
                 sigma2_obs,
                 g,
                 log_prior_odds,
+                &slab_stats,
             );
             if k_seasonal > 0 {
                 let prior = seasonal_regression_prior
@@ -473,6 +513,7 @@ fn run_single_chain_static(
                     sigma2_obs,
                     &prior.beta_mean,
                     &prior.beta_precision,
+                    xtx_seasonal.as_ref(),
                 );
             }
         } else if k > 0 || k_seasonal > 0 {
@@ -493,6 +534,7 @@ fn run_single_chain_static(
                     sigma2_obs,
                     &prior.beta_mean,
                     &prior.beta_precision,
+                    xtx_static.as_ref(),
                 );
                 for gj in gamma.iter_mut() {
                     *gj = true;
@@ -511,6 +553,7 @@ fn run_single_chain_static(
                     sigma2_obs,
                     &prior.beta_mean,
                     &prior.beta_precision,
+                    xtx_seasonal.as_ref(),
                 );
             }
             let sigma_guess = static_regression_prior
@@ -769,6 +812,7 @@ fn block_contribution(x: &[Vec<f64>], beta: &[f64], t: usize) -> f64 {
         .sum::<f64>()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_beta_with_normal_prior<R: rand::Rng>(
     rng: &mut R,
     y_pre: &[f64],
@@ -777,9 +821,14 @@ fn sample_beta_with_normal_prior<R: rand::Rng>(
     sigma2_obs: f64,
     prior_mean: &[f64],
     prior_precision: &[Vec<f64>],
+    xtx_precomputed: Option<&Vec<Vec<f64>>>,
 ) -> Vec<f64> {
     let k = x.len();
-    let xtx = cross_product_matrix(x, y_pre.len());
+    // Use pre-computed X^TX if available (avoids O(k^2 T) per iteration)
+    let xtx = match xtx_precomputed {
+        Some(pre) => pre.clone(),
+        None => cross_product_matrix(x, y_pre.len()),
+    };
 
     let residuals: Vec<f64> = y_pre
         .iter()
@@ -810,10 +859,9 @@ fn sample_beta_with_normal_prior<R: rand::Rng>(
         *value += prior_value;
     }
 
-    let posterior_precision_inverse = invert_matrix(&posterior_precision);
-    let posterior_mean = matrix_vector_product(&posterior_precision_inverse, &rhs);
-    let posterior_covariance = scale_matrix(&posterior_precision_inverse, sigma2_obs);
-    sample_mvnormal(rng, &posterior_mean, &posterior_covariance)
+    // Sample from N(A^{-1}b, sigma2 * A^{-1}) via Cholesky of precision.
+    // Replaces Gauss-Jordan inversion + separate mvnormal sampling.
+    sample_from_precision(rng, &posterior_precision, &rhs, sigma2_obs)
 }
 
 /// Coordinate-wise spike-and-slab sampling for (gamma, beta).
@@ -840,10 +888,10 @@ fn sample_spike_and_slab<R: rand::Rng>(
     sigma2_obs: f64,
     g: f64,
     log_prior_odds: f64,
+    precomputed_stats: &[(f64, f64)],
 ) {
     let one_plus_g = 1.0 + g;
     let log_shrinkage = -0.5 * one_plus_g.ln(); // 0.5 * log(1/(1+g))
-    let t_pre_f = t_pre as f64;
 
     for j in 0..k {
         let x_col = &x[j];
@@ -854,12 +902,8 @@ fn sample_spike_and_slab<R: rand::Rng>(
             *r += x_col[t] * old_beta_j;
         }
 
-        // Compute centered statistics for covariate j
-        let x_sum: f64 = x_col.iter().take(t_pre).sum();
-        let x_mean = x_sum / t_pre_f;
-        let sum_x2: f64 = x_col.iter().take(t_pre).map(|v| v * v).sum();
-        // Centered sum of squares: Σ(x_j - x̄)² = Σx² - T*x̄²
-        let n_j = sum_x2 - t_pre_f * x_mean * x_mean;
+        // Use pre-computed centered statistics (x_mean, n_j) for O(1) lookup
+        let (x_mean, n_j) = precomputed_stats[j];
 
         // Guard against zero/near-zero variance covariates
         if n_j < 1e-12 {
@@ -1095,12 +1139,7 @@ fn matrix_vector_product(matrix: &[Vec<f64>], vector: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-fn scale_matrix(matrix: &[Vec<f64>], scalar: f64) -> Vec<Vec<f64>> {
-    matrix
-        .iter()
-        .map(|row| row.iter().map(|value| value * scalar).collect())
-        .collect()
-}
+
 
 fn sample_post_period_states<R: rand::Rng>(
     rng: &mut R,
@@ -1193,81 +1232,6 @@ fn generate_predictions_dynamic<R: rand::Rng>(
             state + dynamic_reg + seasonal_reg + sample_normal(rng, 0.0, sigma2_obs)
         })
         .collect()
-}
-
-fn invert_matrix(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let k = a.len();
-    if k == 1 {
-        return vec![vec![1.0 / a[0][0]]];
-    }
-
-    let width = 2 * k;
-    let mut augmented = vec![vec![0.0; width]; k];
-    let mut row_index = 0;
-    while row_index < k {
-        let mut col_index = 0;
-        while col_index < k {
-            augmented[row_index][col_index] = a[row_index][col_index];
-            col_index += 1;
-        }
-        augmented[row_index][k + row_index] = 1.0;
-        row_index += 1;
-    }
-
-    let mut pivot_col = 0;
-    while pivot_col < k {
-        let mut max_row = pivot_col;
-        let mut max_value = augmented[pivot_col][pivot_col].abs();
-        let mut candidate_row = pivot_col + 1;
-        while candidate_row < k {
-            let candidate_value = augmented[candidate_row][pivot_col].abs();
-            if candidate_value > max_value {
-                max_value = candidate_value;
-                max_row = candidate_row;
-            }
-            candidate_row += 1;
-        }
-        augmented.swap(pivot_col, max_row);
-
-        if augmented[pivot_col][pivot_col].abs() < 1e-15 {
-            augmented[pivot_col][pivot_col] += 1e-8;
-        }
-        let pivot = augmented[pivot_col][pivot_col];
-
-        let mut normalize_col = 0;
-        while normalize_col < width {
-            augmented[pivot_col][normalize_col] /= pivot;
-            normalize_col += 1;
-        }
-
-        let mut eliminate_row = 0;
-        while eliminate_row < k {
-            if eliminate_row != pivot_col {
-                let factor = augmented[eliminate_row][pivot_col];
-                let mut eliminate_col = 0;
-                while eliminate_col < width {
-                    augmented[eliminate_row][eliminate_col] -=
-                        factor * augmented[pivot_col][eliminate_col];
-                    eliminate_col += 1;
-                }
-            }
-            eliminate_row += 1;
-        }
-
-        pivot_col += 1;
-    }
-
-    let mut inverse = vec![vec![0.0; k]; k];
-    let mut inverse_row = 0;
-    while inverse_row < k {
-        let mut inverse_col = 0;
-        while inverse_col < k {
-            inverse[inverse_row][inverse_col] = augmented[inverse_row][k + inverse_col];
-            inverse_col += 1;
-        }
-        inverse_row += 1;
-    }
-    inverse
 }
 
 #[cfg(test)]
@@ -1444,14 +1408,6 @@ mod tests {
         assert!((prior.beta_precision[1][1] - expected_11).abs() < 1e-12);
         assert!((prior.beta_precision[0][1] - expected_01).abs() < 1e-12);
         assert!((prior.beta_precision[1][0] - expected_01).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_invert_identity() {
-        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let inv = invert_matrix(&a);
-        assert!((inv[0][0] - 1.0).abs() < 1e-10);
-        assert!((inv[1][1] - 1.0).abs() < 1e-10);
     }
 
     #[test]
