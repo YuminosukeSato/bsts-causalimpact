@@ -777,6 +777,7 @@ fn seasonal_kalman_smoother(
     initial_seasonal_var: f64,
 ) -> Vec<Vec<f64>> {
     let t = y.len();
+    let ss = s * s; // stride for flat p_pred indexing
 
     // Z vector: [1, 1, 0, ..., 0]
     // Z'Z = scalar, Z α = α[0] + α[1]
@@ -791,57 +792,91 @@ fn seasonal_kalman_smoother(
         .collect();
 
     // Forward filter stores (needed by DK backward pass)
-    let mut a_pred_store = vec![vec![0.0; s]; t];
-    let mut p_pred_store = vec![vec![vec![0.0; s]; s]; t];
+    // Flat contiguous memory for cache-friendly access
+    let mut a_pred_flat = vec![0.0; t * s]; // a_pred_flat[i*s + j]
+    let mut p_pred_flat = vec![0.0; t * ss]; // p_pred_flat[i*ss + j*s + k]
     let mut v_store = vec![0.0; t]; // innovation v_t
     let mut f_store = vec![0.0; t]; // innovation variance F_t (clamped to F_MIN)
-    let mut k_store = vec![vec![0.0; s]; t]; // Kalman gain K_t
+    let mut k_store_flat = vec![0.0; t * s]; // k_store_flat[i*s + j]
 
     // Single working buffers for a_filt / p_filt (DK backward does not need full arrays)
     let mut a_filt_buf = vec![0.0; s];
-    let mut p_filt_buf = vec![vec![0.0; s]; s];
+    let mut p_filt_flat_buf = vec![0.0; ss]; // flat s×s working buffer
+    let mut row_buf = vec![0.0; s]; // reusable temp for predict_state_covariance_flat
+    let mut v_buf = vec![0.0; s]; // reusable temp for joseph_form_update_flat (P Z')
 
     // Initial state: a_{1|0} = 0, P_{1|0} = diag(init_level_var, init_seasonal_var, ...)
-    // a_pred_store[0] is already zero-initialized
-    p_pred_store[0][0][0] = initial_level_var.max(F_MIN);
+    // a_pred_flat[0..s] is already zero-initialized
+    p_pred_flat[0 * ss + 0 * s + 0] = initial_level_var.max(F_MIN);
     for j in 1..s {
-        p_pred_store[0][j][j] = initial_seasonal_var.max(F_MIN);
+        p_pred_flat[0 * ss + j * s + j] = initial_seasonal_var.max(F_MIN);
     }
 
     // Forward Kalman filter
     for i in 0..t {
-        let a_pred = &a_pred_store[i];
-        let p_pred = &p_pred_store[i];
+        let a_off = i * s;
+        let p_off = i * ss;
+        let k_off = i * s;
 
         // Innovation: v_t = y_t - Z a_{t|t-1} = y_t - a[0] - a[1]
-        let v = y[i] - a_pred[0] - a_pred[1];
+        let v = y[i] - a_pred_flat[a_off] - a_pred_flat[a_off + 1];
         v_store[i] = v;
 
         // Innovation variance: F = Z P Z' + σ²_obs
         // = P[0][0] + 2*P[0][1] + P[1][1] + σ²_obs
-        let f_t = (p_pred[0][0] + 2.0 * p_pred[0][1] + p_pred[1][1] + sigma2_obs).max(F_MIN);
+        let f_t = (p_pred_flat[p_off]
+            + 2.0 * p_pred_flat[p_off + 1]
+            + p_pred_flat[p_off + s + 1]
+            + sigma2_obs)
+            .max(F_MIN);
         f_store[i] = f_t;
         let f_inv = 1.0 / f_t;
 
         // Kalman gain: K = P Z' / F, where Z' = [1, 1, 0, ..., 0]'
         for j in 0..s {
-            k_store[i][j] = (p_pred[j][0] + p_pred[j][1]) * f_inv;
+            k_store_flat[k_off + j] =
+                (p_pred_flat[p_off + j * s] + p_pred_flat[p_off + j * s + 1]) * f_inv;
         }
 
         // Update: a_{t|t} = a_{t|t-1} + K v
         for j in 0..s {
-            a_filt_buf[j] = a_pred[j] + k_store[i][j] * v;
+            a_filt_buf[j] = a_pred_flat[a_off + j] + k_store_flat[k_off + j] * v;
         }
 
         // P_{t|t} via sparse Joseph form (O(s²) instead of O(s⁴))
-        joseph_form_update_inplace(p_pred, &k_store[i], sigma2_obs, s, &mut p_filt_buf);
-        symmetrize_and_floor(&mut p_filt_buf, s);
+        // joseph_form_update_flat produces exactly symmetric output (lower tri copied to upper),
+        // so symmetrize_and_floor is not needed. Only apply diagonal floor.
+        joseph_form_update_flat(
+            &p_pred_flat[p_off..p_off + ss],
+            &k_store_flat[k_off..k_off + s],
+            sigma2_obs,
+            s,
+            &mut p_filt_flat_buf,
+            &mut v_buf,
+        );
+        for d in 0..s {
+            p_filt_flat_buf[d * s + d] = p_filt_flat_buf[d * s + d].max(1e-10);
+        }
 
-        // Predict next step: write directly into a_pred_store[i+1], p_pred_store[i+1]
+        // Predict next step: write directly into stores[i+1]
         if i < t - 1 {
             let next_is_boundary = is_season_boundary(i + 1, season_duration);
-            apply_state_transition_inplace(&a_filt_buf, s, next_is_boundary, &mut a_pred_store[i + 1]);
-            predict_state_covariance_inplace(&p_filt_buf, &q_diag, s, next_is_boundary, &mut p_pred_store[i + 1]);
+            let next_a_off = (i + 1) * s;
+            let next_p_off = (i + 1) * ss;
+            apply_state_transition_inplace(
+                &a_filt_buf,
+                s,
+                next_is_boundary,
+                &mut a_pred_flat[next_a_off..next_a_off + s],
+            );
+            predict_state_covariance_flat(
+                &p_filt_flat_buf,
+                &q_diag,
+                s,
+                next_is_boundary,
+                &mut p_pred_flat[next_p_off..next_p_off + ss],
+                &mut row_buf,
+            );
         }
     }
 
@@ -853,25 +888,20 @@ fn seasonal_kalman_smoother(
     let mut t_prime_r = vec![0.0; s]; // reusable buffer for T' r
 
     for i in (0..t).rev() {
-        // Step 1: update r (from r_i to r_{i-1})
-        // DK (2012) eq (4.32): r_{t-1} = Z' F_t^{-1} v_t + L_t' r_t
-        // where L_t = T_t - K_t^{DK} Z,  K_t^{DK} = T_t K_filter
-        // So L_t' = (I - Z' K_filter') T_t'
-        // L_t' r = T_t' r - Z' (K_filter . T_t' r)
+        let a_off = i * s;
+        let p_off = i * ss;
+        let k_off = i * s;
 
-        // T_t' r: transition from step i to i+1 (writes into pre-allocated buffer)
+        // Step 1: update r (from r_i to r_{i-1})
         let next_is_boundary = is_season_boundary(i + 1, season_duration);
         apply_state_transition_transpose_inplace(&r, s, next_is_boundary, &mut t_prime_r);
 
-        // K_filter . (T' r): dot product of standard Kalman gain with T' r
-        let k_dot_tpr: f64 = k_store[i]
-            .iter()
-            .zip(t_prime_r.iter())
-            .map(|(&k, &tr)| k * tr)
+        // K_filter . (T' r): dot product of Kalman gain with T' r
+        let k_dot_tpr: f64 = (0..s)
+            .map(|j| k_store_flat[k_off + j] * t_prime_r[j])
             .sum();
 
         // r_{i-1}[j] = Z'[j]/F_i * v_i + (T' r)[j] - Z'[j] * (K_filter . T' r)
-        // Z' = [1, 1, 0, ..., 0]
         let v_over_f = v_store[i] / f_store[i];
         for j in 0..s {
             if j < 2 {
@@ -882,13 +912,13 @@ fn seasonal_kalman_smoother(
         }
 
         // Step 2: smoothed state α̂_i = a_{i|i-1} + P_{i|i-1} r_{i-1}
+        // Flat contiguous access for cache efficiency
         for j in 0..s {
-            let correction: f64 = p_pred_store[i][j]
-                .iter()
-                .zip(r.iter())
-                .map(|(&p, &rv)| p * rv)
+            let row_off = p_off + j * s;
+            let correction: f64 = (0..s)
+                .map(|m| p_pred_flat[row_off + m] * r[m])
                 .sum();
-            smooth[i][j] = a_pred_store[i][j] + correction;
+            smooth[i][j] = a_pred_flat[a_off + j] + correction;
         }
     }
 
@@ -1087,6 +1117,123 @@ fn joseph_form_update_inplace(
             out[i][j] = val;
             out[j][i] = val;
         }
+    }
+}
+
+/// Flat-buffer variant of predict_state_covariance: T P T' + Q.
+/// `p` and `out` are flat s×s buffers indexed as [row * s + col].
+/// `row_buf` is a pre-allocated temporary buffer of size s (avoids heap alloc per call).
+fn predict_state_covariance_flat(
+    p: &[f64],
+    q_diag: &[f64],
+    s: usize,
+    is_boundary: bool,
+    out: &mut [f64],
+    row_buf: &mut [f64],
+) {
+    if !is_boundary {
+        // T = I → T*P*T' = P, just copy and add Q diagonal
+        out.copy_from_slice(&p[..s * s]);
+        for j in 0..s {
+            out[j * s + j] = (out[j * s + j] + q_diag[j]).max(F_MIN);
+        }
+        return;
+    }
+
+    // Boundary case: T has sparse structure
+    // Step 1: Compute tp = T * P into `out` as temporary  (O(s²))
+    // All p[] accesses are row-contiguous for cache efficiency.
+    // Row 0: tp[0] = P[0] (copy)
+    out[..s].copy_from_slice(&p[..s]);
+    // Row 1: tp[1][j] = -Σ P[k][j] for k=1..s-1 (accumulate row-by-row)
+    for j in 0..s {
+        out[s + j] = 0.0;
+    }
+    for k in 1..s {
+        let src_off = k * s;
+        for j in 0..s {
+            out[s + j] -= p[src_off + j];
+        }
+    }
+    // Rows 2..s-1: tp[r] = P[r-1] (shift, row copy)
+    for r in 2..s {
+        let dst_off = r * s;
+        let src_off = (r - 1) * s;
+        out[dst_off..dst_off + s].copy_from_slice(&p[src_off..src_off + s]);
+    }
+
+    // Step 2: Compute result = tp * T' in-place using pre-allocated row buffer
+    for i in 0..s {
+        let row_off = i * s;
+        row_buf[0] = out[row_off];
+        let mut col1_sum = 0.0;
+        for k in 1..s {
+            col1_sum += out[row_off + k];
+        }
+        row_buf[1] = -col1_sum;
+        for c in 2..s {
+            row_buf[c] = out[row_off + c - 1];
+        }
+        out[row_off..row_off + s].copy_from_slice(&row_buf[..s]);
+    }
+
+    // Symmetrize: TP T' is theoretically symmetric when P is symmetric.
+    // FP rounding can introduce tiny asymmetries (order of ε_machine * ||P||).
+    // We symmetrize to maintain SPD properties for downstream Kalman gain.
+    for i in 0..s {
+        for j in (i + 1)..s {
+            let avg = 0.5 * (out[i * s + j] + out[j * s + i]);
+            out[i * s + j] = avg;
+            out[j * s + i] = avg;
+        }
+    }
+
+    // Add Q diagonal and enforce positive
+    for j in 0..s {
+        out[j * s + j] = (out[j * s + j] + q_diag[j]).max(F_MIN);
+    }
+}
+
+/// Flat-buffer variant of joseph_form_update.
+/// `p_pred` and `out` are flat s×s buffers indexed as [row * s + col].
+/// `v_buf` is a pre-allocated temporary buffer of size s for (P Z')_j values.
+fn joseph_form_update_flat(
+    p_pred: &[f64],
+    k_gain: &[f64],
+    sigma2_obs: f64,
+    s: usize,
+    out: &mut [f64],
+    v_buf: &mut [f64],
+) {
+    // v[j] = (P Z')_j = P[j][0] + P[j][1]
+    for j in 0..s {
+        v_buf[j] = p_pred[j * s] + p_pred[j * s + 1];
+    }
+    // F = Z P Z' + σ²_obs = v[0] + v[1] + σ²_obs
+    let f = v_buf[0] + v_buf[1] + sigma2_obs;
+
+    // P_new[i][j] = P[i][j] - K[i]*v[j] - v[i]*K[j] + K[i]*K[j]*F
+    for i in 0..s {
+        let ki = k_gain[i];
+        let vi = v_buf[i];
+        let ki_f = ki * f;
+        for j in 0..=i {
+            let val = p_pred[i * s + j] - ki * v_buf[j] - vi * k_gain[j] + ki_f * k_gain[j];
+            out[i * s + j] = val;
+            out[j * s + i] = val;
+        }
+    }
+}
+
+/// Flat-buffer variant of symmetrize_and_floor.
+fn symmetrize_and_floor_flat(p: &mut [f64], s: usize) {
+    for row in 0..s {
+        for col in (row + 1)..s {
+            let avg = 0.5 * (p[row * s + col] + p[col * s + row]);
+            p[row * s + col] = avg;
+            p[col * s + row] = avg;
+        }
+        p[row * s + row] = p[row * s + row].max(1e-10);
     }
 }
 
