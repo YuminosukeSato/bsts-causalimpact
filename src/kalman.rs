@@ -850,6 +850,7 @@ fn seasonal_kalman_smoother(
     // α̂_t = a_{t|t-1} + P_{t|t-1} r_{t-1}
     let mut smooth = vec![vec![0.0; s]; t];
     let mut r = vec![0.0; s]; // r_T = 0
+    let mut t_prime_r = vec![0.0; s]; // reusable buffer for T' r
 
     for i in (0..t).rev() {
         // Step 1: update r (from r_i to r_{i-1})
@@ -858,9 +859,9 @@ fn seasonal_kalman_smoother(
         // So L_t' = (I - Z' K_filter') T_t'
         // L_t' r = T_t' r - Z' (K_filter . T_t' r)
 
-        // T_t' r: transition from step i to i+1
+        // T_t' r: transition from step i to i+1 (writes into pre-allocated buffer)
         let next_is_boundary = is_season_boundary(i + 1, season_duration);
-        let t_prime_r = apply_state_transition_transpose(&r, s, next_is_boundary);
+        apply_state_transition_transpose_inplace(&r, s, next_is_boundary, &mut t_prime_r);
 
         // K_filter . (T' r): dot product of standard Kalman gain with T' r
         let k_dot_tpr: f64 = k_store[i]
@@ -932,35 +933,35 @@ fn apply_state_transition_inplace(
 /// Apply transition transpose: T' * vector
 fn apply_state_transition_transpose(v: &[f64], s: usize, is_boundary: bool) -> Vec<f64> {
     let mut result = vec![0.0; s];
+    apply_state_transition_transpose_inplace(v, s, is_boundary, &mut result);
+    result
+}
+
+/// In-place variant: writes T' * v into `out`.
+fn apply_state_transition_transpose_inplace(
+    v: &[f64],
+    s: usize,
+    is_boundary: bool,
+    out: &mut [f64],
+) {
     // T'[0][0] = 1 (level row of T is [1, 0, 0, ...])
-    result[0] = v[0];
+    out[0] = v[0];
 
     if is_boundary {
-        // T' for seasonal block (transpose of the rotation matrix):
-        // T_seasonal = [-1, -1, ..., -1]  (first row)
-        //              [ 1,  0, ...,  0]  (shift rows)
-        //              [ 0,  1, ...,  0]
-        //              ...
-        // T'_seasonal[j][k] = T_seasonal[k][j]
-        // T'[1][1] = -1, T'[1][2] = 1, T'[1][j>=3] = 0
-        // T'[j][1] = -1, T'[j][j+1] = 1 for j in 1..S-2
-        // T'[S-1][1] = -1
-
         for j in 1..s {
             // Column j of T has: T[1][j] = -1 (sum-to-zero row)
             //                    T[j+1][j] = 1 if j+1 < s (shift)
-            result[j] = -v[1]; // from the -1 in first seasonal row
+            out[j] = -v[1]; // from the -1 in first seasonal row
             if j + 1 < s {
-                result[j] += v[j + 1]; // from the shift: T[j+1][j] = 1
+                out[j] += v[j + 1]; // from the shift: T[j+1][j] = 1
             }
         }
     } else {
         // Identity for seasonal block: T' = T = I
         for j in 1..s {
-            result[j] = v[j];
+            out[j] = v[j];
         }
     }
-    result
 }
 
 /// Predict state covariance: T P T' + Q
