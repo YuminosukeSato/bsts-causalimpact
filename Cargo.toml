@@ -12,3 +12,8 @@ pyo3 = { version = "0.28", features = ["extension-module"] }
 rand = "0.8"
 rayon = "1.10"
 rand_distr = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
