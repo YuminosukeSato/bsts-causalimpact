@@ -1126,57 +1126,82 @@ fn predict_state_covariance_flat(
         return;
     }
 
-    // Boundary case: T has sparse structure
-    // Step 1: Compute tp = T * P into `out` as temporary  (O(s²))
-    // All p[] accesses are row-contiguous for cache efficiency.
-    // Row 0: tp[0] = P[0] (copy)
-    out[..s].copy_from_slice(&p[..s]);
-    // Row 1: tp[1][j] = -Σ P[k][j] for k=1..s-1 (accumulate row-by-row)
-    for j in 0..s {
-        out[s + j] = 0.0;
-    }
-    for k in 1..s {
-        let src_off = k * s;
-        for j in 0..s {
-            out[s + j] -= p[src_off + j];
-        }
-    }
-    // Rows 2..s-1: tp[r] = P[r-1] (shift, row copy)
-    for r in 2..s {
-        let dst_off = r * s;
-        let src_off = (r - 1) * s;
-        out[dst_off..dst_off + s].copy_from_slice(&p[src_off..src_off + s]);
+    // Boundary case: closed-form T*P*T' + Q using sparse T structure.
+    //
+    // T (s×s transition matrix at season boundary):
+    //   Row 0: [1, 0, 0, ..., 0]          (level random walk)
+    //   Row 1: [0, -1, -1, ..., -1]       (sum-to-zero seasonal)
+    //   Row r (r≥2): [0, ..., 1(col=r-1), ..., 0]  (shift)
+    //
+    // Closed-form (T*P*T')[i][j] for lower triangle (j ≤ i), then mirror:
+    //   row_sums[l] = Σ_{k=1..s-1} P[l][k]   (precomputed per row)
+    //   (0,0): P[0][0]
+    //   (1,0): -row_sums[0]
+    //   (1,1): Σ_{l=1..s-1} row_sums[l]       (= total_seasonal_sum)
+    //   (i≥2, 0): P[(i-1)*s]
+    //   (i≥2, 1): -row_sums[i-1]
+    //   (i≥2, j in 2..i-1): P[(i-1)*s + j-1]
+    //   (i≥2, j=i): P[(i-1)*s + i-1]          (diagonal)
+
+    // Verify input P is symmetric (fusion relies on this)
+    #[cfg(debug_assertions)]
+    {
+        let max_asym = (0..s)
+            .flat_map(|i| (i + 1..s).map(move |j| (p[i * s + j] - p[j * s + i]).abs()))
+            .fold(0.0f64, f64::max);
+        debug_assert!(
+            max_asym < 1e-10,
+            "predict_cov_flat: input P not symmetric, max_asym={}",
+            max_asym
+        );
     }
 
-    // Step 2: Compute result = tp * T' in-place using pre-allocated row buffer
-    for i in 0..s {
-        let row_off = i * s;
-        row_buf[0] = out[row_off];
-        let mut col1_sum = 0.0;
+    // Pass 0: row_sums precompute (reuse row_buf)
+    for l in 0..s {
+        let row_off = l * s;
+        let mut sum = 0.0;
         for k in 1..s {
-            col1_sum += out[row_off + k];
+            sum += p[row_off + k];
         }
-        row_buf[1] = -col1_sum;
-        for c in 2..s {
-            row_buf[c] = out[row_off + c - 1];
-        }
-        out[row_off..row_off + s].copy_from_slice(&row_buf[..s]);
+        row_buf[l] = sum;
     }
+    let total_seasonal_sum: f64 = row_buf[1..s].iter().sum();
 
-    // Symmetrize: TP T' is theoretically symmetric when P is symmetric.
-    // FP rounding can introduce tiny asymmetries (order of ε_machine * ||P||).
-    // We symmetrize to maintain SPD properties for downstream Kalman gain.
-    for i in 0..s {
-        for j in (i + 1)..s {
-            let avg = 0.5 * (out[i * s + j] + out[j * s + i]);
-            out[i * s + j] = avg;
-            out[j * s + i] = avg;
+    // Pass 1: write lower triangle + mirror + Q diagonal
+    // (0,0)
+    out[0] = (p[0] + q_diag[0]).max(F_MIN);
+
+    // (1,0) and mirror (0,1)
+    let val_10 = -row_buf[0];
+    out[1 * s] = val_10;
+    out[1] = val_10;
+
+    // (1,1)
+    out[1 * s + 1] = (total_seasonal_sum + q_diag[1]).max(F_MIN);
+
+    // Rows i >= 2
+    for i in 2..s {
+        let src_row = (i - 1) * s; // P row (i-1)
+
+        // (i, 0): P[(i-1)*s + 0] = P[i-1][0]
+        let val_i0 = p[src_row];
+        out[i * s] = val_i0;
+        out[i] = val_i0; // mirror (0, i)
+
+        // (i, 1): -row_sums[i-1]
+        let val_i1 = -row_buf[i - 1];
+        out[i * s + 1] = val_i1;
+        out[1 * s + i] = val_i1; // mirror (1, i)
+
+        // (i, j) for 2 <= j < i: P[(i-1)*s + j-1]
+        for j in 2..i {
+            let val = p[src_row + j - 1];
+            out[i * s + j] = val;
+            out[j * s + i] = val; // mirror
         }
-    }
 
-    // Add Q diagonal and enforce positive
-    for j in 0..s {
-        out[j * s + j] = (out[j * s + j] + q_diag[j]).max(F_MIN);
+        // (i, i): diagonal
+        out[i * s + i] = (p[src_row + i - 1] + q_diag[i]).max(F_MIN);
     }
 }
 
