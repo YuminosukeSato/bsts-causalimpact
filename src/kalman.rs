@@ -829,25 +829,8 @@ fn seasonal_kalman_smoother(
             a_filt[i][j] = a_pred[j] + k_gain[j] * v;
         }
 
-        // P_{t|t} = (I - K Z) P (I - K Z)' + K σ²_obs K'  (Joseph form)
-        // Z row: [1, 1, 0, ..., 0]
-        for row in 0..s {
-            for col in 0..s {
-                let mut val = 0.0;
-                for m in 0..s {
-                    // (I - KZ)[row][m] = δ(row,m) - K[row]*Z[m]
-                    let z_m = if m <= 1 { 1.0 } else { 0.0 };
-                    let ikz_rm = if row == m { 1.0 } else { 0.0 } - k_gain[row] * z_m;
-                    for n in 0..s {
-                        let z_n = if n <= 1 { 1.0 } else { 0.0 };
-                        let ikz_cn = if col == n { 1.0 } else { 0.0 } - k_gain[col] * z_n;
-                        val += ikz_rm * p_pred[m][n] * ikz_cn;
-                    }
-                }
-                val += k_gain[row] * sigma2_obs * k_gain[col];
-                p_filt[i][row][col] = val;
-            }
-        }
+        // P_{t|t} via sparse Joseph form (O(s²) instead of O(s⁴))
+        p_filt[i] = joseph_form_update(&p_pred, &k_gain, sigma2_obs, s);
         symmetrize_and_floor(&mut p_filt[i], s);
 
         // Predict next step
@@ -952,49 +935,117 @@ fn apply_state_transition_transpose(v: &[f64], s: usize, is_boundary: bool) -> V
 }
 
 /// Predict state covariance: T P T' + Q
+///
+/// Analytical expansion exploiting T's sparse structure:
+/// - non-boundary (T = I): result = P + diag(Q) → O(s²)
+/// - boundary: T*P computed via sparse row formulas, then (T*P)*T' → O(s²)
 fn predict_state_covariance(
     p: &[Vec<f64>],
     q_diag: &[f64],
     s: usize,
     is_boundary: bool,
 ) -> Vec<Vec<f64>> {
-    let mut result = vec![vec![0.0; s]; s];
+    if !is_boundary {
+        // T = I → T*P*T' = P, just clone and add Q diagonal
+        let mut result = p.to_vec();
+        for j in 0..s {
+            result[j][j] = (result[j][j] + q_diag[j]).max(F_MIN);
+        }
+        return result;
+    }
 
-    // T P T' computed element-wise
-    for row in 0..s {
-        for col in 0..=row {
-            let mut val = 0.0;
-            for m in 0..s {
-                let t_rm = transition_element(row, m, s, is_boundary);
-                if t_rm == 0.0 {
-                    continue;
-                }
-                for n in 0..s {
-                    let t_cn = transition_element(col, n, s, is_boundary);
-                    if t_cn != 0.0 {
-                        val += t_rm * p[m][n] * t_cn;
-                    }
-                }
-            }
-            result[row][col] = val;
-            result[col][row] = val; // symmetric
+    // Boundary case: T has sparse structure:
+    //   row 0: T[0][0]=1 (level, rest 0)
+    //   row 1: T[1][j]=-1 for j=1..s-1 (sum-to-zero)
+    //   row r>=2: T[r][r-1]=1 (shift)
+
+    // Step 1: Compute tp = T * P  (O(s²))
+    // tp[0][j] = P[0][j]                      (T row 0 = [1, 0, ...])
+    // tp[1][j] = -sum(P[k][j], k=1..s-1)      (T row 1 = [0, -1, -1, ..., -1])
+    // tp[r][j] = P[r-1][j]  for r >= 2        (T row r: shift)
+    let mut tp = vec![vec![0.0; s]; s];
+    for j in 0..s {
+        tp[0][j] = p[0][j];
+        let mut row1_sum = 0.0;
+        for k in 1..s {
+            row1_sum += p[k][j];
+        }
+        tp[1][j] = -row1_sum;
+        for r in 2..s {
+            tp[r][j] = p[r - 1][j];
         }
     }
 
-    // Add Q diagonal
-    for j in 0..s {
-        result[j][j] += q_diag[j];
+    // Step 2: Compute result = tp * T'  (O(s²))
+    // T' column structure:
+    //   col 0: T'[j][0] = T[0][j] → only T'[0][0]=1
+    //   col 1: T'[j][1] = T[1][j] → T'[j][1]=-1 for j=1..s-1
+    //   col c>=2: T'[j][c] = T[c][j] → only T'[c-1][c]=1
+    //
+    // result[i][0] = tp[i][0]
+    // result[i][1] = -sum(tp[i][k], k=1..s-1)
+    // result[i][c] = tp[i][c-1]  for c >= 2
+    let mut result = vec![vec![0.0; s]; s];
+    for i in 0..s {
+        result[i][0] = tp[i][0];
+        let mut col1_sum = 0.0;
+        for k in 1..s {
+            col1_sum += tp[i][k];
+        }
+        result[i][1] = -col1_sum;
+        for c in 2..s {
+            result[i][c] = tp[i][c - 1];
+        }
     }
 
-    // Enforce positive diagonal
+    // Symmetrize (floating point can introduce tiny asymmetries)
+    for i in 0..s {
+        for j in (i + 1)..s {
+            let avg = 0.5 * (result[i][j] + result[j][i]);
+            result[i][j] = avg;
+            result[j][i] = avg;
+        }
+    }
+
+    // Add Q diagonal and enforce positive
     for j in 0..s {
-        result[j][j] = result[j][j].max(F_MIN);
+        result[j][j] = (result[j][j] + q_diag[j]).max(F_MIN);
     }
 
     result
 }
 
-/// Get element T[row][col] of the transition matrix.
+/// Joseph form update: P_new = (I - K Z) P (I - K Z)' + K σ²_obs K'
+///
+/// Exploits Z = [1, 1, 0, ..., 0] sparsity: rank-1 update formulation.
+///   v[j] = P[j][0] + P[j][1]  (= (P Z')_j)
+///   F = v[0] + v[1] + σ²_obs  (innovation variance)
+///   P_new[i][j] = P[i][j] - K[i]*v[j] - v[i]*K[j] + K[i]*K[j]*F
+fn joseph_form_update(
+    p_pred: &[Vec<f64>],
+    k_gain: &[f64],
+    sigma2_obs: f64,
+    s: usize,
+) -> Vec<Vec<f64>> {
+    // v[j] = (P Z')_j = P[j][0] + P[j][1]
+    let v: Vec<f64> = (0..s).map(|j| p_pred[j][0] + p_pred[j][1]).collect();
+    // F = Z P Z' + σ²_obs = v[0] + v[1] + σ²_obs
+    let f = v[0] + v[1] + sigma2_obs;
+
+    let mut result = vec![vec![0.0; s]; s];
+    for i in 0..s {
+        for j in 0..=i {
+            let val = p_pred[i][j] - k_gain[i] * v[j] - v[i] * k_gain[j]
+                + k_gain[i] * k_gain[j] * f;
+            result[i][j] = val;
+            result[j][i] = val;
+        }
+    }
+    result
+}
+
+/// Get element T[row][col] of the transition matrix (used only by naive test reference).
+#[cfg(test)]
 #[inline]
 fn transition_element(row: usize, col: usize, _s: usize, is_boundary: bool) -> f64 {
     if row == 0 && col == 0 {
@@ -1494,5 +1545,513 @@ mod tests {
         assert_eq!(count_season_boundaries(1, 1), 0); // no boundaries
         assert_eq!(count_season_boundaries(0, 1), 0);
         assert_eq!(count_season_boundaries(14, 7), 1); // t=7
+    }
+
+    // ─── PR-B: Analytical expansion tests ───
+    //
+    // Reference naive implementation of predict_state_covariance
+    // (the original O(s⁴) version, kept for comparison testing).
+    fn predict_state_covariance_naive(
+        p: &[Vec<f64>],
+        q_diag: &[f64],
+        s: usize,
+        is_boundary: bool,
+    ) -> Vec<Vec<f64>> {
+        let mut result = vec![vec![0.0; s]; s];
+        for row in 0..s {
+            for col in 0..=row {
+                let mut val = 0.0;
+                for m in 0..s {
+                    let t_rm = transition_element(row, m, s, is_boundary);
+                    if t_rm == 0.0 {
+                        continue;
+                    }
+                    for n in 0..s {
+                        let t_cn = transition_element(col, n, s, is_boundary);
+                        if t_cn != 0.0 {
+                            val += t_rm * p[m][n] * t_cn;
+                        }
+                    }
+                }
+                result[row][col] = val;
+                result[col][row] = val;
+            }
+        }
+        for j in 0..s {
+            result[j][j] += q_diag[j];
+        }
+        for j in 0..s {
+            result[j][j] = result[j][j].max(F_MIN);
+        }
+        result
+    }
+
+    // Reference naive implementation of Joseph form update
+    // (the original O(s⁴) inline version, extracted for comparison).
+    fn joseph_form_update_naive(
+        p_pred: &[Vec<f64>],
+        k_gain: &[f64],
+        sigma2_obs: f64,
+        s: usize,
+    ) -> Vec<Vec<f64>> {
+        let mut result = vec![vec![0.0; s]; s];
+        for row in 0..s {
+            for col in 0..s {
+                let mut val = 0.0;
+                for m in 0..s {
+                    let z_m = if m <= 1 { 1.0 } else { 0.0 };
+                    let ikz_rm = if row == m { 1.0 } else { 0.0 } - k_gain[row] * z_m;
+                    for n in 0..s {
+                        let z_n = if n <= 1 { 1.0 } else { 0.0 };
+                        let ikz_cn = if col == n { 1.0 } else { 0.0 } - k_gain[col] * z_n;
+                        val += ikz_rm * p_pred[m][n] * ikz_cn;
+                    }
+                }
+                val += k_gain[row] * sigma2_obs * k_gain[col];
+                result[row][col] = val;
+            }
+        }
+        result
+    }
+
+    /// Generate a random SPD matrix of size s.
+    fn random_spd(s: usize, seed: u64) -> Vec<Vec<f64>> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let a: Vec<Vec<f64>> = (0..s)
+            .map(|_| (0..s).map(|_| rng.gen::<f64>() - 0.5).collect())
+            .collect();
+        // P = A'A + 0.01*I (guaranteed SPD)
+        let mut p = vec![vec![0.0; s]; s];
+        for i in 0..s {
+            for j in 0..s {
+                for k in 0..s {
+                    p[i][j] += a[k][i] * a[k][j];
+                }
+            }
+            p[i][i] += 0.01;
+        }
+        p
+    }
+
+    fn q_diag_for(s: usize, sigma2_level: f64, sigma2_seasonal: f64) -> Vec<f64> {
+        (0..s)
+            .map(|j| match j {
+                0 => sigma2_level,
+                1 => sigma2_seasonal,
+                _ => 0.0,
+            })
+            .collect()
+    }
+
+    fn max_abs_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .flat_map(|(ra, rb)| ra.iter().zip(rb.iter()))
+            .map(|(&x, &y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn is_symmetric(m: &[Vec<f64>], tol: f64) -> bool {
+        let s = m.len();
+        for i in 0..s {
+            for j in (i + 1)..s {
+                if (m[i][j] - m[j][i]).abs() > tol {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // ── predict_state_covariance: analytical vs naive (15 tests) ──
+
+    #[test]
+    fn test_predict_cov_analytical_matches_naive_s2_boundary() {
+        let p = random_spd(2, 100);
+        let q = q_diag_for(2, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, 2, true);
+        let actual = predict_state_covariance(&p, &q, 2, true);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=2 boundary: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_analytical_matches_naive_s2_intra() {
+        let p = random_spd(2, 101);
+        let q = q_diag_for(2, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, 2, false);
+        let actual = predict_state_covariance(&p, &q, 2, false);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=2 intra: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_analytical_matches_naive_s4_boundary() {
+        let p = random_spd(4, 102);
+        let q = q_diag_for(4, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, 4, true);
+        let actual = predict_state_covariance(&p, &q, 4, true);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=4 boundary: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_analytical_matches_naive_s7_boundary() {
+        let p = random_spd(7, 103);
+        let q = q_diag_for(7, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, 7, true);
+        let actual = predict_state_covariance(&p, &q, 7, true);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=7 boundary: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_analytical_matches_naive_s12_boundary() {
+        let p = random_spd(12, 104);
+        let q = q_diag_for(12, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, 12, true);
+        let actual = predict_state_covariance(&p, &q, 12, true);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=12 boundary: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_analytical_matches_naive_s52_boundary() {
+        let p = random_spd(52, 105);
+        let q = q_diag_for(52, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, 52, true);
+        let actual = predict_state_covariance(&p, &q, 52, true);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=52 boundary: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_analytical_matches_naive_s168_boundary() {
+        let p = random_spd(168, 106);
+        let q = q_diag_for(168, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, 168, true);
+        let actual = predict_state_covariance(&p, &q, 168, true);
+        // s=168: 167-element sums produce O(s × ε_machine) rounding differences
+        // between naive 4-loop and analytical 2-step expansion
+        let max_val = expected
+            .iter()
+            .flat_map(|r| r.iter())
+            .map(|&v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1e-12);
+        assert!(
+            max_abs_diff(&expected, &actual) < max_val * 1e-10,
+            "s=168 boundary: max diff = {}, max_val = {}",
+            max_abs_diff(&expected, &actual),
+            max_val
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_identity_p_boundary_equals_t_t_transpose_s4() {
+        // P = I → T*I*T' = T*T'
+        let s = 4;
+        let mut p = vec![vec![0.0; s]; s];
+        for j in 0..s {
+            p[j][j] = 1.0;
+        }
+        let q = vec![0.0; s]; // no Q to isolate T*T'
+        let result = predict_state_covariance(&p, &q, s, true);
+        let expected = predict_state_covariance_naive(&p, &q, s, true);
+        assert!(max_abs_diff(&result, &expected) < 1e-12);
+    }
+
+    #[test]
+    fn test_predict_cov_identity_p_boundary_equals_t_t_transpose_s12() {
+        let s = 12;
+        let mut p = vec![vec![0.0; s]; s];
+        for j in 0..s {
+            p[j][j] = 1.0;
+        }
+        let q = vec![0.0; s];
+        let result = predict_state_covariance(&p, &q, s, true);
+        let expected = predict_state_covariance_naive(&p, &q, s, true);
+        assert!(max_abs_diff(&result, &expected) < 1e-12);
+    }
+
+    #[test]
+    fn test_predict_cov_zero_p_equals_q_diag_s7() {
+        // P = 0 → result = Q
+        let s = 7;
+        let p = vec![vec![0.0; s]; s];
+        let q = q_diag_for(s, 0.05, 0.02);
+        let result = predict_state_covariance(&p, &q, s, true);
+        for j in 0..s {
+            assert!(
+                (result[j][j] - q[j].max(F_MIN)).abs() < 1e-12,
+                "diagonal {} mismatch: {} vs {}",
+                j,
+                result[j][j],
+                q[j].max(F_MIN)
+            );
+            for k in 0..s {
+                if k != j {
+                    assert!(
+                        result[j][k].abs() < 1e-12,
+                        "off-diagonal [{},{}] = {} should be 0",
+                        j,
+                        k,
+                        result[j][k]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_predict_cov_result_is_symmetric_s4_boundary() {
+        let p = random_spd(4, 110);
+        let q = q_diag_for(4, 0.01, 0.005);
+        let result = predict_state_covariance(&p, &q, 4, true);
+        assert!(is_symmetric(&result, 1e-12), "result should be symmetric");
+    }
+
+    #[test]
+    fn test_predict_cov_result_is_symmetric_s12_boundary() {
+        let p = random_spd(12, 111);
+        let q = q_diag_for(12, 0.01, 0.005);
+        let result = predict_state_covariance(&p, &q, 12, true);
+        assert!(is_symmetric(&result, 1e-12), "result should be symmetric");
+    }
+
+    #[test]
+    fn test_predict_cov_near_singular_p_s12() {
+        // Near-singular P: min eigenvalue ~1e-12
+        let s = 12;
+        let base = random_spd(s, 112);
+        let mut p = vec![vec![0.0; s]; s];
+        // Scale to very small values
+        for i in 0..s {
+            for j in 0..s {
+                p[i][j] = base[i][j] * 1e-12;
+            }
+        }
+        let q = q_diag_for(s, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, s, true);
+        let actual = predict_state_covariance(&p, &q, s, true);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "near-singular P: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_large_p_diagonal_s12() {
+        // P with large diagonal (P[i][i] = 1e8)
+        let s = 12;
+        let mut p = random_spd(s, 113);
+        for i in 0..s {
+            p[i][i] = 1e8;
+        }
+        let q = q_diag_for(s, 0.01, 0.005);
+        let expected = predict_state_covariance_naive(&p, &q, s, true);
+        let actual = predict_state_covariance(&p, &q, s, true);
+        // Relative tolerance for large values
+        let max_val = expected
+            .iter()
+            .flat_map(|r| r.iter())
+            .map(|&v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs_diff(&expected, &actual) < max_val * 1e-10,
+            "large P: max diff = {}, max_val = {}",
+            max_abs_diff(&expected, &actual),
+            max_val
+        );
+    }
+
+    #[test]
+    fn test_predict_cov_q_diag_zero_s7() {
+        // Frozen seasonal: Q = 0
+        let s = 7;
+        let p = random_spd(s, 114);
+        let q = vec![0.0; s];
+        let expected = predict_state_covariance_naive(&p, &q, s, true);
+        let actual = predict_state_covariance(&p, &q, s, true);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "Q=0: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    // ── Joseph form: analytical vs naive (7 tests) ──
+
+    fn make_joseph_test_data(s: usize, seed: u64) -> (Vec<Vec<f64>>, Vec<f64>, f64) {
+        let p = random_spd(s, seed);
+        let sigma2_obs = 0.5;
+        // Compute realistic K gain: K = P Z' / F
+        // Z = [1, 1, 0, ..., 0]
+        let v: Vec<f64> = (0..s).map(|j| p[j][0] + p[j][1]).collect();
+        let f_t = (v[0] + v[1] + sigma2_obs).max(F_MIN);
+        let k_gain: Vec<f64> = v.iter().map(|&vi| vi / f_t).collect();
+        (p, k_gain, sigma2_obs)
+    }
+
+    #[test]
+    fn test_joseph_form_analytical_matches_naive_s2() {
+        let (p, k, obs) = make_joseph_test_data(2, 200);
+        let expected = joseph_form_update_naive(&p, &k, obs, 2);
+        let actual = joseph_form_update(&p, &k, obs, 2);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=2: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_joseph_form_analytical_matches_naive_s4() {
+        let (p, k, obs) = make_joseph_test_data(4, 201);
+        let expected = joseph_form_update_naive(&p, &k, obs, 4);
+        let actual = joseph_form_update(&p, &k, obs, 4);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=4: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_joseph_form_analytical_matches_naive_s7() {
+        let (p, k, obs) = make_joseph_test_data(7, 202);
+        let expected = joseph_form_update_naive(&p, &k, obs, 7);
+        let actual = joseph_form_update(&p, &k, obs, 7);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=7: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_joseph_form_analytical_matches_naive_s12() {
+        let (p, k, obs) = make_joseph_test_data(12, 203);
+        let expected = joseph_form_update_naive(&p, &k, obs, 12);
+        let actual = joseph_form_update(&p, &k, obs, 12);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=12: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_joseph_form_analytical_matches_naive_s168() {
+        let (p, k, obs) = make_joseph_test_data(168, 204);
+        let expected = joseph_form_update_naive(&p, &k, obs, 168);
+        let actual = joseph_form_update(&p, &k, obs, 168);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "s=168: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_joseph_form_result_is_symmetric_s12() {
+        let (p, k, obs) = make_joseph_test_data(12, 205);
+        let result = joseph_form_update(&p, &k, obs, 12);
+        assert!(is_symmetric(&result, 1e-12), "Joseph form result should be symmetric");
+    }
+
+    #[test]
+    fn test_joseph_form_near_singular_k_gain_s4() {
+        // Near-singular: F very small → large K gain
+        let s = 4;
+        let p = random_spd(s, 206);
+        let sigma2_obs = 1e-15; // tiny obs variance → F ≈ Z P Z'
+        let v: Vec<f64> = (0..s).map(|j| p[j][0] + p[j][1]).collect();
+        let f_t = (v[0] + v[1] + sigma2_obs).max(F_MIN);
+        let k_gain: Vec<f64> = v.iter().map(|&vi| vi / f_t).collect();
+        let expected = joseph_form_update_naive(&p, &k_gain, sigma2_obs, s);
+        let actual = joseph_form_update(&p, &k_gain, sigma2_obs, s);
+        let max_val = expected
+            .iter()
+            .flat_map(|r| r.iter())
+            .map(|&v| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1e-12);
+        assert!(
+            max_abs_diff(&expected, &actual) < max_val * 1e-10,
+            "near-singular K: max diff = {}, max_val = {}",
+            max_abs_diff(&expected, &actual),
+            max_val
+        );
+    }
+
+    // ── Smoother integration (3 tests) ──
+
+    #[test]
+    fn test_seasonal_smoother_analytical_all_finite_s4() {
+        let mut rng = StdRng::seed_from_u64(300);
+        let y: Vec<f64> = (0..20).map(|i| ((i % 4) as f64 - 1.5) * 2.0).collect();
+        let (levels, s1_obs, ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 0.1, 0.001, 0.01, 4, 1, 0.0, 1.0);
+        for (i, &v) in levels.iter().enumerate() {
+            assert!(v.is_finite(), "levels[{}] = {} not finite", i, v);
+        }
+        for (i, &v) in s1_obs.iter().enumerate() {
+            assert!(v.is_finite(), "s1_obs[{}] = {} not finite", i, v);
+        }
+        assert!(ssd.is_finite(), "ssd = {} not finite", ssd);
+    }
+
+    #[test]
+    fn test_seasonal_smoother_analytical_all_finite_s12() {
+        let mut rng = StdRng::seed_from_u64(301);
+        let y: Vec<f64> = (0..48).map(|i| ((i % 12) as f64 - 5.5) * 0.5).collect();
+        let (levels, s1_obs, ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 0.1, 0.001, 0.01, 12, 1, 0.0, 1.0);
+        for (i, &v) in levels.iter().enumerate() {
+            assert!(v.is_finite(), "levels[{}] = {} not finite", i, v);
+        }
+        for (i, &v) in s1_obs.iter().enumerate() {
+            assert!(v.is_finite(), "s1_obs[{}] = {} not finite", i, v);
+        }
+        assert!(ssd.is_finite(), "ssd = {} not finite", ssd);
+    }
+
+    #[test]
+    fn test_seasonal_smoother_r_compatible_100steps_s12() {
+        // Run smoother, verify output lengths and finite values
+        // (R compatibility is tested at Python level via test_numerical_equivalence.py)
+        let mut rng = StdRng::seed_from_u64(302);
+        let y: Vec<f64> = (0..100).map(|i| ((i % 12) as f64 - 5.5) * 0.3 + 10.0).collect();
+        let (levels, s1_obs, ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 0.5, 0.01, 0.01, 12, 1, 10.0, 1.0);
+        assert_eq!(levels.len(), 100);
+        assert_eq!(s1_obs.len(), 100);
+        assert!(ssd >= 0.0);
+        for &v in &levels {
+            assert!(v.is_finite());
+        }
+        for &v in &s1_obs {
+            assert!(v.is_finite());
+        }
     }
 }
