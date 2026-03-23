@@ -6,9 +6,7 @@ R bsts AddSeasonal() 互換の実装に対応。
 
 import numpy as np
 import pandas as pd
-import pytest
 from causal_impact import CausalImpact
-
 
 MCMC_ARGS_FAST = {"niter": 500, "nwarmup": 200, "seed": 42, "prior_level_sd": 0.01}
 MCMC_ARGS_MEDIUM = {"niter": 2000, "nwarmup": 500, "seed": 42, "prior_level_sd": 0.01}
@@ -36,7 +34,7 @@ class TestSeasonalSmootherIntegration:
     def test_sigma_seasonal_exists_when_nseasons_set(self):
         """nseasons > 1 のとき sigma_seasonal が非空であること."""
         df, pre, post = _make_seasonal_df()
-        ci = CausalImpact(
+        CausalImpact(
             df, pre, post, model_args={**MCMC_ARGS_FAST, "nseasons": 7}
         )
         from causal_impact._core import run_gibbs_sampler
@@ -85,7 +83,8 @@ class TestSeasonalSmootherIntegration:
         niter, nwarmup = 100, 30
         y = [20.0 + np.sin(2 * np.pi * i / 7) for i in range(84)]
         result = run_gibbs_sampler(
-            y, None, 56, niter, nwarmup, 1, 42, 0.01, 1.0, 7.0, 1.0, False, "local_level"
+            y, None, 56, niter, nwarmup, 1, 42,
+            0.01, 1.0, 7.0, 1.0, False, "local_level",
         )
         assert len(result.sigma_seasonal) == niter
 
