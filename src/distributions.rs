@@ -18,7 +18,7 @@ pub fn sample_normal<R: Rng>(rng: &mut R, mean: f64, variance: f64) -> f64 {
 /// Cholesky decomposition: A = L L^T, returns L (lower triangular).
 /// A must be symmetric positive definite.
 /// Near-zero or negative diagonals are clamped to 1e-12 for numerical stability.
-pub fn cholesky_lower(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
+fn cholesky_lower(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let k = a.len();
     let mut lower = vec![vec![0.0; k]; k];
     for i in 0..k {
@@ -67,7 +67,7 @@ fn backward_solve_lt(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
 }
 
 /// Solve L L^T x = b via forward + backward substitution.
-pub fn chol_solve_lower(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+fn chol_solve_lower(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     let y = forward_solve(l, b);
     backward_solve_lt(l, &y)
 }
