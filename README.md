@@ -1,5 +1,9 @@
 # bsts-causalimpact
 
+[![PyPI version](https://img.shields.io/pypi/v/bsts-causalimpact)](https://pypi.org/project/bsts-causalimpact/)
+[![Python](https://img.shields.io/pypi/pyversions/bsts-causalimpact)](https://pypi.org/project/bsts-causalimpact/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Bayesian structural time series for causal inference in Python.
 A faithful port of Google's [CausalImpact](https://google.github.io/CausalImpact/) R package. No TensorFlow required.
 
@@ -63,6 +67,28 @@ print(ci.report())
 # Plot the results
 fig = ci.plot()
 fig.savefig("causal_impact.png")
+```
+
+### Example Output
+
+![CausalImpact plot example](docs/images/causal_impact_example.png)
+
+```
+Posterior inference {CausalImpact}
+
+                         Average        Cumulative
+Actual                   136.32          3953.19
+Prediction (s.d.)        125.42 (0.66)   3637.07 (19.08)
+95% CI                   [124.18, 126.71]  [3601.33, 3674.59]
+
+Absolute effect (s.d.)   10.90 (0.66)    316.13 (19.08)
+95% CI                   [9.61, 12.13]   [278.60, 351.86]
+
+Relative effect (s.d.)   8.69% (0.57%) 8.69% (0.57%)
+95% CI                   [7.58%, 9.77%] [7.58%, 9.77%]
+
+Posterior tail-area probability p: 0.001
+Posterior prob. of a causal effect: 99.90%
 ```
 
 ## Comparison with Alternatives
