@@ -607,6 +607,431 @@ fn cholesky_solve(a: &[Vec<f64>], b: &[f64], k: usize) -> Vec<f64> {
     x
 }
 
+/// Local level + seasonal state-space simulation smoother (Durbin-Koopman 2002, Jarociński 2015).
+///
+/// State vector: α_t = [μ_t, s_1(t), ..., s_{S-1}(t)]' ∈ ℝ^S
+/// Observation: y_t = Z α_t + ε_t,  Z = [1, 1, 0, ..., 0]
+/// Transition:
+///   - season boundary (t % season_duration == 0):
+///       μ_{t+1} = μ_t + η_level
+///       s_1(t+1) = -Σ s_j(t) + η_seasonal
+///       s_j(t+1) = s_{j-1}(t)  for j >= 2
+///   - intra-season (otherwise):
+///       μ_{t+1} = μ_t + η_level
+///       seasonal state unchanged (identity)
+/// Process noise: Q = diag(σ²_level, σ²_seasonal, 0, ..., 0)
+///
+/// Returns:
+///   levels:         Vec<f64>  — μ_t (T values)
+///   s1_obs:         Vec<f64>  — s_1(t), seasonal component observed at each t
+///   innovation_ssd: f64       — Σ η_{s,t}², sufficient statistic for σ²_seasonal sampling
+#[allow(clippy::too_many_arguments)]
+pub fn local_level_seasonal_smoother<R: Rng>(
+    rng: &mut R,
+    y_residual: &[f64],
+    sigma2_obs: f64,
+    sigma2_level: f64,
+    sigma2_seasonal: f64,
+    nseasons: usize,
+    season_duration: usize,
+    initial_state_mean: f64,
+    initial_state_var: f64,
+) -> (Vec<f64>, Vec<f64>, f64) {
+    let t = y_residual.len();
+    let s = nseasons; // state dimension = nseasons (level + S-1 seasonal)
+
+    if t == 0 {
+        return (vec![], vec![], 0.0);
+    }
+    if s < 2 {
+        // Degenerate: no seasonal component, fallback to simple smoother
+        let levels = simulation_smoother(
+            rng,
+            y_residual,
+            sigma2_obs,
+            sigma2_level,
+            initial_state_mean,
+            initial_state_var,
+        );
+        return (levels, vec![0.0; t], 0.0);
+    }
+
+    // Center observations around initial_state_mean (Jarociński fix: a1=0)
+    let centered_y: Vec<f64> = y_residual
+        .iter()
+        .map(|v| v - initial_state_mean)
+        .collect();
+
+    // Initial state variance for seasonal components
+    let seasonal_init_var = initial_state_var;
+
+    // Step 1: Draw α⁺ from prior → generate y⁺
+    let mut alpha_plus = vec![vec![0.0; s]; t];
+    let mut y_plus = vec![0.0; t];
+
+    // α⁺_0 ~ N(0, diag(init_var, seasonal_init_var, ...))
+    alpha_plus[0][0] = sample_normal(rng, 0.0, initial_state_var);
+    for j in 1..s {
+        alpha_plus[0][j] = sample_normal(rng, 0.0, seasonal_init_var);
+    }
+    // y⁺_0 = Z α⁺_0 + ε⁺ = α⁺[0][0] + α⁺[0][1] + ε⁺
+    y_plus[0] = alpha_plus[0][0] + alpha_plus[0][1] + sample_normal(rng, 0.0, sigma2_obs);
+
+    for i in 1..t {
+        // Copy previous state to avoid borrow conflict
+        let prev: Vec<f64> = alpha_plus[i - 1].clone();
+
+        // Level: random walk
+        alpha_plus[i][0] = prev[0] + sample_normal(rng, 0.0, sigma2_level);
+
+        if is_season_boundary(i, season_duration) {
+            // Seasonal transition: s_1(t) = -Σ s_j(t-1) + η_seasonal
+            let seasonal_sum: f64 = prev[1..s].iter().sum();
+            alpha_plus[i][1] = -seasonal_sum + sample_normal(rng, 0.0, sigma2_seasonal);
+            // s_j(t) = s_{j-1}(t-1) for j >= 2
+            for j in 2..s {
+                alpha_plus[i][j] = prev[j - 1];
+            }
+        } else {
+            // Intra-season: seasonal state unchanged
+            for j in 1..s {
+                alpha_plus[i][j] = prev[j];
+            }
+        }
+
+        y_plus[i] = alpha_plus[i][0] + alpha_plus[i][1] + sample_normal(rng, 0.0, sigma2_obs);
+    }
+
+    // Step 2: y* = centered_y - y⁺
+    let y_star: Vec<f64> = centered_y
+        .iter()
+        .zip(&y_plus)
+        .map(|(y, yp)| y - yp)
+        .collect();
+
+    // Step 3-5: Kalman filter + RTS smoother on y*
+    let alpha_hat = seasonal_kalman_smoother(
+        &y_star,
+        sigma2_obs,
+        sigma2_level,
+        sigma2_seasonal,
+        s,
+        season_duration,
+        initial_state_var,
+        seasonal_init_var,
+    );
+
+    // Step 6: α = α̂* + α⁺ + mean correction
+    let mut levels = vec![0.0; t];
+    let mut s1_obs = vec![0.0; t];
+
+    for i in 0..t {
+        levels[i] = alpha_hat[i][0] + alpha_plus[i][0] + initial_state_mean;
+        s1_obs[i] = alpha_hat[i][1] + alpha_plus[i][1];
+    }
+
+    // Compute innovation_ssd: Σ (η_{s,t})² at season boundaries
+    // η_{s,t} = s_1(t) - expected_s1 = s_1(t) - (-Σ_{j=1}^{S-1} s_j(t-1))
+    let full_states: Vec<Vec<f64>> = (0..t)
+        .map(|i| {
+            let mut state = vec![0.0; s];
+            state[0] = alpha_hat[i][0] + alpha_plus[i][0];
+            for j in 1..s {
+                state[j] = alpha_hat[i][j] + alpha_plus[i][j];
+            }
+            state
+        })
+        .collect();
+
+    let mut innovation_ssd = 0.0;
+    for i in 1..t {
+        if is_season_boundary(i, season_duration) {
+            let expected_s1: f64 = -full_states[i - 1][1..s].iter().sum::<f64>();
+            let eta = full_states[i][1] - expected_s1;
+            innovation_ssd += eta * eta;
+        }
+    }
+
+    (levels, s1_obs, innovation_ssd)
+}
+
+/// Whether time step t is a season boundary.
+#[inline]
+fn is_season_boundary(t: usize, season_duration: usize) -> bool {
+    t % season_duration == 0
+}
+
+/// S-dimensional Kalman filter + RTS smoother for local level + seasonal model.
+///
+/// State equation uses time-varying transition (season boundary vs intra-season).
+/// Returns smoothed state estimates α̂_t (T × S).
+#[allow(clippy::too_many_arguments)]
+fn seasonal_kalman_smoother(
+    y: &[f64],
+    sigma2_obs: f64,
+    sigma2_level: f64,
+    sigma2_seasonal: f64,
+    s: usize,
+    season_duration: usize,
+    initial_level_var: f64,
+    initial_seasonal_var: f64,
+) -> Vec<Vec<f64>> {
+    let t = y.len();
+
+    // Z vector: [1, 1, 0, ..., 0]
+    // Z'Z = scalar, Z α = α[0] + α[1]
+
+    // Q diagonal: [sigma2_level, sigma2_seasonal, 0, ..., 0]
+    let q_diag: Vec<f64> = (0..s)
+        .map(|j| match j {
+            0 => sigma2_level,
+            1 => sigma2_seasonal,
+            _ => 0.0,
+        })
+        .collect();
+
+    // Forward filter storage
+    let mut a_filt = vec![vec![0.0; s]; t];
+    let mut p_filt = vec![vec![vec![0.0; s]; s]; t];
+
+    // Store predicted values for RTS smoother
+    let mut a_pred_store = vec![vec![0.0; s]; t];
+    let mut p_pred_store = vec![vec![vec![0.0; s]; s]; t];
+
+    // Initial state: a_0|0 = 0, P_0 = diag(init_level_var, init_seasonal_var, ...)
+    let mut a_pred = vec![0.0; s];
+    let mut p_pred = vec![vec![0.0; s]; s];
+    p_pred[0][0] = initial_level_var.max(F_MIN);
+    for j in 1..s {
+        p_pred[j][j] = initial_seasonal_var.max(F_MIN);
+    }
+
+    // Forward Kalman filter
+    for i in 0..t {
+        a_pred_store[i] = a_pred.clone();
+        p_pred_store[i] = p_pred.clone();
+
+        // Innovation: v_t = y_t - Z a_{t|t-1} = y_t - a[0] - a[1]
+        let v = y[i] - a_pred[0] - a_pred[1];
+
+        // Innovation variance: F = Z P Z' + σ²_obs
+        // = P[0][0] + 2*P[0][1] + P[1][1] + σ²_obs
+        let f_t = (p_pred[0][0] + 2.0 * p_pred[0][1] + p_pred[1][1] + sigma2_obs).max(F_MIN);
+        let f_inv = 1.0 / f_t;
+
+        // Kalman gain: K = P Z' / F, where Z' = [1, 1, 0, ..., 0]'
+        let k_gain: Vec<f64> = (0..s)
+            .map(|j| (p_pred[j][0] + p_pred[j][1]) * f_inv)
+            .collect();
+
+        // Update: a_{t|t} = a_{t|t-1} + K v
+        for j in 0..s {
+            a_filt[i][j] = a_pred[j] + k_gain[j] * v;
+        }
+
+        // P_{t|t} = (I - K Z) P (I - K Z)' + K σ²_obs K'  (Joseph form)
+        // Z row: [1, 1, 0, ..., 0]
+        for row in 0..s {
+            for col in 0..s {
+                let mut val = 0.0;
+                for m in 0..s {
+                    // (I - KZ)[row][m] = δ(row,m) - K[row]*Z[m]
+                    let z_m = if m <= 1 { 1.0 } else { 0.0 };
+                    let ikz_rm = if row == m { 1.0 } else { 0.0 } - k_gain[row] * z_m;
+                    for n in 0..s {
+                        let z_n = if n <= 1 { 1.0 } else { 0.0 };
+                        let ikz_cn = if col == n { 1.0 } else { 0.0 } - k_gain[col] * z_n;
+                        val += ikz_rm * p_pred[m][n] * ikz_cn;
+                    }
+                }
+                val += k_gain[row] * sigma2_obs * k_gain[col];
+                p_filt[i][row][col] = val;
+            }
+        }
+        symmetrize_and_floor(&mut p_filt[i], s);
+
+        // Predict next step
+        if i < t - 1 {
+            let next_is_boundary = is_season_boundary(i + 1, season_duration);
+            // Apply transition: a_{t+1|t} = T a_{t|t}
+            a_pred = apply_state_transition(&a_filt[i], s, next_is_boundary);
+            // P_{t+1|t} = T P_{t|t} T' + Q
+            p_pred = predict_state_covariance(&p_filt[i], &q_diag, s, next_is_boundary);
+        }
+    }
+
+    // RTS backward smoother using Cholesky solve for numerical stability
+    let mut smooth = vec![vec![0.0; s]; t];
+    smooth[t - 1] = a_filt[t - 1].clone();
+
+    for i in (0..t - 1).rev() {
+        let next_is_boundary = is_season_boundary(i + 1, season_duration);
+
+        // P_{t+1|t} (from the stored prediction at i+1)
+        let p_pred_next = &p_pred_store[i + 1];
+
+        // Smoother gain: G_t = P_{t|t} T' solve(P_{t+1|t}, .)
+        // d = α̂_{t+1} - a_{t+1|t}
+        let d: Vec<f64> = (0..s)
+            .map(|j| smooth[i + 1][j] - a_pred_store[i + 1][j])
+            .collect();
+
+        // z = solve(P_{t+1|t}, d)
+        let z = cholesky_solve(p_pred_next, &d, s);
+
+        // T' z: we need P_{t|t} T' z
+        let t_prime_z = apply_state_transition_transpose(&z, s, next_is_boundary);
+
+        // α̂_t = a_{t|t} + P_{t|t} T' z
+        for j in 0..s {
+            let correction: f64 = (0..s).map(|m| p_filt[i][j][m] * t_prime_z[m]).sum();
+            smooth[i][j] = a_filt[i][j] + correction;
+        }
+    }
+
+    smooth
+}
+
+/// Apply state transition: T * state
+/// For season boundary: level RW + seasonal rotation
+/// For intra-season: level RW + seasonal freeze
+fn apply_state_transition(state: &[f64], s: usize, is_boundary: bool) -> Vec<f64> {
+    let mut result = vec![0.0; s];
+    // Level: always random walk
+    result[0] = state[0];
+
+    if is_boundary {
+        // Seasonal rotation: s_1(t+1) = -Σ s_j(t)
+        let seasonal_sum: f64 = state[1..s].iter().sum();
+        result[1] = -seasonal_sum;
+        // s_j(t+1) = s_{j-1}(t) for j >= 2
+        for j in 2..s {
+            result[j] = state[j - 1];
+        }
+    } else {
+        // Intra-season: seasonal state unchanged
+        for j in 1..s {
+            result[j] = state[j];
+        }
+    }
+    result
+}
+
+/// Apply transition transpose: T' * vector
+fn apply_state_transition_transpose(v: &[f64], s: usize, is_boundary: bool) -> Vec<f64> {
+    let mut result = vec![0.0; s];
+    // T'[0][0] = 1 (level row of T is [1, 0, 0, ...])
+    result[0] = v[0];
+
+    if is_boundary {
+        // T' for seasonal block (transpose of the rotation matrix):
+        // T_seasonal = [-1, -1, ..., -1]  (first row)
+        //              [ 1,  0, ...,  0]  (shift rows)
+        //              [ 0,  1, ...,  0]
+        //              ...
+        // T'_seasonal[j][k] = T_seasonal[k][j]
+        // T'[1][1] = -1, T'[1][2] = 1, T'[1][j>=3] = 0
+        // T'[j][1] = -1, T'[j][j+1] = 1 for j in 1..S-2
+        // T'[S-1][1] = -1
+
+        for j in 1..s {
+            // Column j of T has: T[1][j] = -1 (sum-to-zero row)
+            //                    T[j+1][j] = 1 if j+1 < s (shift)
+            result[j] = -v[1]; // from the -1 in first seasonal row
+            if j + 1 < s {
+                result[j] += v[j + 1]; // from the shift: T[j+1][j] = 1
+            }
+        }
+    } else {
+        // Identity for seasonal block: T' = T = I
+        for j in 1..s {
+            result[j] = v[j];
+        }
+    }
+    result
+}
+
+/// Predict state covariance: T P T' + Q
+fn predict_state_covariance(
+    p: &[Vec<f64>],
+    q_diag: &[f64],
+    s: usize,
+    is_boundary: bool,
+) -> Vec<Vec<f64>> {
+    let mut result = vec![vec![0.0; s]; s];
+
+    // T P T' computed element-wise
+    for row in 0..s {
+        for col in 0..=row {
+            let mut val = 0.0;
+            for m in 0..s {
+                let t_rm = transition_element(row, m, s, is_boundary);
+                if t_rm == 0.0 {
+                    continue;
+                }
+                for n in 0..s {
+                    let t_cn = transition_element(col, n, s, is_boundary);
+                    if t_cn != 0.0 {
+                        val += t_rm * p[m][n] * t_cn;
+                    }
+                }
+            }
+            result[row][col] = val;
+            result[col][row] = val; // symmetric
+        }
+    }
+
+    // Add Q diagonal
+    for j in 0..s {
+        result[j][j] += q_diag[j];
+    }
+
+    // Enforce positive diagonal
+    for j in 0..s {
+        result[j][j] = result[j][j].max(F_MIN);
+    }
+
+    result
+}
+
+/// Get element T[row][col] of the transition matrix.
+#[inline]
+fn transition_element(row: usize, col: usize, _s: usize, is_boundary: bool) -> f64 {
+    if row == 0 && col == 0 {
+        return 1.0; // level: random walk
+    }
+    if row == 0 || col == 0 {
+        return 0.0; // no cross-coupling between level and seasonal
+    }
+    // Seasonal block (rows/cols 1..s-1)
+    if is_boundary {
+        if row == 1 {
+            return -1.0; // sum-to-zero: s_1(t+1) = -Σ s_j(t)
+        }
+        if col == row - 1 {
+            return 1.0; // shift: s_j(t+1) = s_{j-1}(t)
+        }
+        0.0
+    } else {
+        // Identity for seasonal block
+        if row == col {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Count the number of season boundaries in [1, t_end).
+pub fn count_season_boundaries(t_end: usize, season_duration: usize) -> usize {
+    if t_end <= 1 || season_duration == 0 {
+        return 0;
+    }
+    // Boundaries at t=1, 2, ..., t_end-1 where t % season_duration == 0
+    // t=0 is not a boundary (it's initial)
+    (1..t_end).filter(|&t| is_season_boundary(t, season_duration)).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,5 +1192,307 @@ mod tests {
 
         assert!((mean_last_level - 27.7).abs() < 2.0);
         assert!((mean_last_slope - 0.3).abs() < 0.2);
+    }
+
+    // ─── local_level_seasonal_smoother tests ───
+
+    #[test]
+    fn test_lls_output_len_equals_t() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let (levels, s1_obs, _ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.01, 7, 1, 0.0, 1.0);
+        assert_eq!(levels.len(), y.len());
+        assert_eq!(s1_obs.len(), y.len());
+    }
+
+    #[test]
+    fn test_lls_t_equals_1() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y = vec![5.0];
+        let (levels, s1_obs, ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.01, 7, 1, 5.0, 1.0);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(s1_obs.len(), 1);
+        assert!(levels[0].is_finite());
+        assert!(s1_obs[0].is_finite());
+        assert_eq!(ssd, 0.0); // no innovation at t=0
+    }
+
+    #[test]
+    fn test_lls_nseasons_2() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y = vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+        let (levels, s1_obs, _ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 0.1, 0.001, 0.01, 2, 1, 0.0, 1.0);
+        assert_eq!(levels.len(), 6);
+        assert_eq!(s1_obs.len(), 6);
+        for &v in &levels {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_lls_nseasons_7() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // 7-period seasonal pattern
+        let pattern = vec![-3.0, -2.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let y: Vec<f64> = (0..28).map(|i| pattern[i % 7]).collect();
+        let (levels, s1_obs, ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 0.1, 0.001, 0.01, 7, 1, 0.0, 1.0);
+        assert_eq!(levels.len(), 28);
+        assert_eq!(s1_obs.len(), 28);
+        assert!(ssd >= 0.0);
+    }
+
+    #[test]
+    fn test_lls_nseasons_12() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y: Vec<f64> = (0..48).map(|i| ((i % 12) as f64 - 5.5) * 0.5).collect();
+        let (levels, s1_obs, _ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 0.1, 0.001, 0.01, 12, 1, 0.0, 1.0);
+        assert_eq!(levels.len(), 48);
+        assert_eq!(s1_obs.len(), 48);
+    }
+
+    #[test]
+    fn test_lls_transition_sum_to_zero() {
+        // Verify that apply_state_transition preserves sum-to-zero for seasonal
+        let state = vec![5.0, 2.0, -1.0, 3.0]; // s=4, seasonal: [2, -1, 3]
+        let result = apply_state_transition(&state, 4, true);
+        // new seasonal sum = result[1] + result[2] + result[3]
+        // = -(2 + -1 + 3) + 2 + (-1) = -4 + 2 - 1 = -3
+        // Old sum = 2 + -1 + 3 = 4
+        // After rotation: [-4, 2, -1] → sum = -4 + 2 - 1 = -3
+        // Actually, sum-to-zero means all S seasons sum to 0.
+        // The "missing" season is -sum of stored S-1 seasons.
+        // Before: stored = [2, -1, 3], missing = -(2-1+3) = -4
+        // After: new[1] = -sum = -4, new[2] = old[1] = 2, new[3] = old[2] = -1
+        // Stored = [-4, 2, -1], missing = -(-4+2-1) = 3 = old[3]
+        assert_eq!(result[0], 5.0); // level unchanged
+        assert_eq!(result[1], -4.0); // -sum of [2, -1, 3]
+        assert_eq!(result[2], 2.0); // shift from [1]
+        assert_eq!(result[3], -1.0); // shift from [2]
+    }
+
+    #[test]
+    fn test_lls_tracks_strong_seasonal() {
+        // Strong seasonal signal with known pattern
+        let pattern = vec![-3.0, -2.0, 0.0, 1.0, 2.0, 3.0, 4.0];
+        let y: Vec<f64> = (0..56).map(|i| pattern[i % 7]).collect();
+
+        let n_samples = 100;
+        let mut mean_s1 = vec![0.0; 56];
+        for seed in 0..n_samples {
+            let mut rng = StdRng::seed_from_u64(seed as u64);
+            let (_, s1_obs, _) = local_level_seasonal_smoother(
+                &mut rng, &y, 0.01, 0.001, 0.01, 7, 1, 0.0, 1.0,
+            );
+            for (mean, &s) in mean_s1.iter_mut().zip(s1_obs.iter()) {
+                *mean += s / n_samples as f64;
+            }
+        }
+
+        // s1 should track the pattern approximately: first season = -3 (centered)
+        // The mean of the pattern is (-3-2+0+1+2+3+4)/7 = 5/7 ≈ 0.714
+        // So first season centered ≈ -3 - 0.714 = -3.714
+        // Just check the sign alternation follows the pattern
+        assert!(
+            mean_s1[0] < 0.0,
+            "First season should be negative, got {}",
+            mean_s1[0]
+        );
+        assert!(
+            mean_s1[6] > 0.0,
+            "Seventh season should be positive, got {}",
+            mean_s1[6]
+        );
+    }
+
+    #[test]
+    fn test_lls_no_signal_seasonal_near_zero() {
+        // Constant signal with no seasonal component
+        let y: Vec<f64> = vec![5.0; 28];
+        let n_samples = 100;
+        let mut mean_s1 = vec![0.0; 28];
+        for seed in 0..n_samples {
+            let mut rng = StdRng::seed_from_u64(seed as u64);
+            let (_, s1_obs, _) = local_level_seasonal_smoother(
+                &mut rng, &y, 1.0, 0.01, 0.001, 7, 1, 5.0, 1.0,
+            );
+            for (mean, &s) in mean_s1.iter_mut().zip(s1_obs.iter()) {
+                *mean += s / n_samples as f64;
+            }
+        }
+
+        // With no seasonal signal, s1 should be near zero on average
+        for &s in &mean_s1 {
+            assert!(
+                s.abs() < 1.0,
+                "Seasonal component should be near zero for constant signal, got {}",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn test_lls_levels_plus_s1_matches_y_when_obs_var_tiny() {
+        // When σ²_obs → 0, levels + s1 should closely match y_residual
+        let pattern = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
+        let y: Vec<f64> = (0..20).map(|i| pattern[i % 5]).collect();
+        let n_samples = 50;
+        let mut mean_fit = vec![0.0; 20];
+        for seed in 0..n_samples {
+            let mut rng = StdRng::seed_from_u64(seed as u64);
+            let (levels, s1_obs, _) = local_level_seasonal_smoother(
+                &mut rng, &y, 1e-8, 0.001, 0.01, 5, 1, 0.0, 1.0,
+            );
+            for (mean, (l, s)) in mean_fit
+                .iter_mut()
+                .zip(levels.iter().zip(s1_obs.iter()))
+            {
+                *mean += (l + s) / n_samples as f64;
+            }
+        }
+
+        for (i, (&m, &y_val)) in mean_fit.iter().zip(y.iter()).enumerate() {
+            assert!(
+                (m - y_val).abs() < 1.0,
+                "fit[{}] = {} should be near y = {}",
+                i,
+                m,
+                y_val
+            );
+        }
+    }
+
+    #[test]
+    fn test_lls_innovation_ssd_nonneg() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y: Vec<f64> = (0..14).map(|i| (i % 7) as f64).collect();
+        let (_, _, ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.01, 7, 1, 0.0, 1.0);
+        assert!(ssd >= 0.0, "innovation_ssd must be non-negative, got {}", ssd);
+    }
+
+    #[test]
+    fn test_lls_innovation_ssd_large_for_varying_seasonal() {
+        // Seasonal signal that changes over time → larger innovation_ssd
+        let y_stable: Vec<f64> = (0..28).map(|i| (i % 7) as f64).collect();
+        let y_changing: Vec<f64> = (0..28)
+            .map(|i| (i % 7) as f64 * (1.0 + 0.1 * i as f64))
+            .collect();
+
+        let mut ssd_stable_sum = 0.0;
+        let mut ssd_changing_sum = 0.0;
+        let n_samples = 50;
+        for seed in 0..n_samples {
+            let mut rng = StdRng::seed_from_u64(seed as u64);
+            let (_, _, ssd1) = local_level_seasonal_smoother(
+                &mut rng, &y_stable, 0.1, 0.001, 0.01, 7, 1, 0.0, 1.0,
+            );
+            let mut rng2 = StdRng::seed_from_u64(seed as u64 + 1000);
+            let (_, _, ssd2) = local_level_seasonal_smoother(
+                &mut rng2, &y_changing, 0.1, 0.001, 0.01, 7, 1, 0.0, 1.0,
+            );
+            ssd_stable_sum += ssd1;
+            ssd_changing_sum += ssd2;
+        }
+        // The changing seasonal should have larger average innovation_ssd
+        assert!(
+            ssd_changing_sum > ssd_stable_sum,
+            "Changing seasonal ssd {} should be > stable ssd {}",
+            ssd_changing_sum / n_samples as f64,
+            ssd_stable_sum / n_samples as f64
+        );
+    }
+
+    #[test]
+    fn test_lls_finite_sigma2_seasonal_zero() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y = vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+        let (levels, s1_obs, ssd) =
+            local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.0, 3, 1, 0.0, 1.0);
+        for &v in &levels {
+            assert!(v.is_finite(), "levels should be finite when sigma2_seasonal=0");
+        }
+        for &v in &s1_obs {
+            assert!(v.is_finite(), "s1_obs should be finite when sigma2_seasonal=0");
+        }
+        assert!(ssd.is_finite());
+    }
+
+    #[test]
+    fn test_lls_finite_sigma2_obs_tiny() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let (levels, s1_obs, _) = local_level_seasonal_smoother(
+            &mut rng, &y, 1e-12, 0.01, 0.01, 7, 1, 0.0, 1.0,
+        );
+        for &v in &levels {
+            assert!(v.is_finite(), "levels should be finite with tiny sigma2_obs");
+        }
+        for &v in &s1_obs {
+            assert!(v.is_finite(), "s1_obs should be finite with tiny sigma2_obs");
+        }
+    }
+
+    #[test]
+    fn test_lls_finite_init_var_large() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let y = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let (levels, s1_obs, _) = local_level_seasonal_smoother(
+            &mut rng, &y, 1.0, 0.01, 0.01, 7, 1, 0.0, 1e6,
+        );
+        for &v in &levels {
+            assert!(v.is_finite(), "levels should be finite with large init_var");
+        }
+        for &v in &s1_obs {
+            assert!(v.is_finite(), "s1_obs should be finite with large init_var");
+        }
+    }
+
+    #[test]
+    fn test_lls_season_duration_2() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // With duration=2, boundaries at t=0,2,4,6,...
+        let y: Vec<f64> = (0..14).map(|i| ((i / 2) % 3) as f64).collect();
+        let (levels, s1_obs, _) =
+            local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.01, 3, 2, 0.0, 1.0);
+        assert_eq!(levels.len(), 14);
+        assert_eq!(s1_obs.len(), 14);
+        for &v in &levels {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_lls_season_duration_7() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // Weekly seasonal: 4 weeks × 7 days = 28 observations
+        let y: Vec<f64> = (0..28).map(|i| ((i / 7) % 4) as f64).collect();
+        let (levels, s1_obs, _) =
+            local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.01, 4, 7, 0.0, 1.0);
+        assert_eq!(levels.len(), 28);
+        assert_eq!(s1_obs.len(), 28);
+    }
+
+    #[test]
+    fn test_lls_intra_season_state_frozen() {
+        // With duration=2, odd timesteps should have same seasonal state as even
+        let state = vec![5.0, 2.0, -1.0]; // s=3
+        let intra = apply_state_transition(&state, 3, false);
+        assert_eq!(intra[0], 5.0); // level unchanged
+        assert_eq!(intra[1], 2.0); // seasonal frozen
+        assert_eq!(intra[2], -1.0); // seasonal frozen
+    }
+
+    #[test]
+    fn test_count_season_boundaries() {
+        assert_eq!(count_season_boundaries(7, 1), 6); // t=1..6
+        assert_eq!(count_season_boundaries(8, 2), 3); // t=2,4,6
+        assert_eq!(count_season_boundaries(1, 1), 0); // no boundaries
+        assert_eq!(count_season_boundaries(0, 1), 0);
+        assert_eq!(count_season_boundaries(14, 7), 1); // t=7
     }
 }
