@@ -8,7 +8,7 @@ mod kalman;
 mod sampler;
 mod state_space;
 
-const MODULE_VERSION: &str = "1.3.0";
+const MODULE_VERSION: &str = "1.3.1";
 
 #[pyclass(skip_from_py_object)]
 #[derive(Clone)]
