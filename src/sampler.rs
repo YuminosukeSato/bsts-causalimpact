@@ -46,7 +46,7 @@ pub struct GibbsResult {
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_sampler(
-    y: Vec<f64>,
+    y: &[f64],
     x: Vec<Vec<f64>>,
     pre_end: usize,
     niter: usize,
@@ -60,7 +60,7 @@ pub fn run_sampler(
     dynamic_regression: bool,
     state_model: &str,
 ) -> Result<GibbsResult, String> {
-    validate_inputs(&y, pre_end, nchains)?;
+    validate_inputs(y, pre_end, nchains)?;
 
     let k = x.len();
     if k > 0 && expected_model_size <= 0.0 && !dynamic_regression {
@@ -69,13 +69,13 @@ pub fn run_sampler(
 
     let seasonal = SeasonalConfig::from_optional(nseasons, season_duration)?;
     let state_model = StateModel::from_name(state_model)?;
-    let model = StateSpaceModel::new(y.clone(), x, seasonal);
+    let model = StateSpaceModel::new(y.len(), x, seasonal);
     let n_samples = niter * nchains;
     let chain_results: Vec<ChainResult> = (0..nchains)
         .into_par_iter()
         .map(|chain_id| {
             run_single_chain(
-                &y,
+                y,
                 &model,
                 pre_end,
                 niter,
@@ -206,13 +206,23 @@ fn run_single_chain_dynamic(
         gamma: Vec::with_capacity(0), // spike-and-slab disabled
         predictions: Vec::with_capacity(niter),
     };
+    let mut adjusted = vec![0.0; pre_end];
+    let mut beta_targets = vec![0.0; pre_end];
+    let mut baseline = vec![0.0; pre_end];
 
     for iter in 0..(niter + nwarmup) {
         // Step 1: State sampling — subtract time-varying x'β_t from y
-        let y_adj = adjusted_observations_dynamic(y, model, &beta_t, &seasonal_beta, pre_end);
+        fill_adjusted_observations_dynamic(
+            &mut adjusted,
+            y,
+            model,
+            &beta_t,
+            &seasonal_beta,
+            pre_end,
+        );
         let (states, slopes) = sample_state_path(
             &mut rng,
-            &y_adj,
+            &adjusted,
             sigma2_obs,
             sigma2_level,
             sigma2_slope,
@@ -223,18 +233,17 @@ fn run_single_chain_dynamic(
 
         // Step 2: Dynamic β_t sampling via multivariate FFBS
         if k > 0 {
-            let y_adj_beta: Vec<f64> = y[..pre_end]
-                .iter()
-                .zip(states.iter())
-                .enumerate()
-                .map(|(t, (&y_val, &mu))| {
-                    y_val - mu - block_contribution(model.seasonal_covariates(), &seasonal_beta, t)
-                })
-                .collect();
+            fill_beta_targets_without_dynamic_regression(
+                &mut beta_targets,
+                &y[..pre_end],
+                &states,
+                model.seasonal_covariates(),
+                &seasonal_beta,
+            );
 
             beta_t = dynamic_beta_smoother(
                 &mut rng,
-                &y_adj_beta,
+                &beta_targets,
                 model.covariates(),
                 sigma2_obs,
                 &sigma2_beta,
@@ -299,17 +308,7 @@ fn run_single_chain_dynamic(
             let prior = seasonal_regression_prior
                 .as_ref()
                 .expect("seasonal regression prior must exist when seasonal regressors exist");
-            let baseline: Vec<f64> = states
-                .iter()
-                .enumerate()
-                .map(|(t, &mu)| {
-                    mu + if k > 0 {
-                        block_contribution(model.covariates(), &beta_t[t], t)
-                    } else {
-                        0.0
-                    }
-                })
-                .collect();
+            fill_dynamic_baseline(&mut baseline, &states, model, &beta_t);
             seasonal_beta = sample_beta_with_normal_prior(
                 &mut rng,
                 &y[..pre_end],
@@ -442,18 +441,21 @@ fn run_single_chain_static(
     // Storage for seasonal state propagation
     let mut seasonal_state: Vec<f64> = vec![0.0; nseasons];
     let mut s1_obs_pre = vec![0.0; pre_end];
+    let mut adjusted = vec![0.0; pre_end];
+    let mut y_residual = vec![0.0; pre_end];
+    let mut residual = vec![0.0; pre_end];
+    let mut baseline = vec![0.0; pre_end];
 
     for iter in 0..(niter + nwarmup) {
         if use_state_seasonal {
             // ── State-space seasonal path ──
             // Step 1: Compute y_residual = y - x'β
-            let y_residual: Vec<f64> = y[..pre_end]
-                .iter()
-                .enumerate()
-                .map(|(t, &y_val)| {
-                    y_val - block_contribution(model.covariates(), &beta, t)
-                })
-                .collect();
+            fill_state_residual_from_covariates(
+                &mut y_residual,
+                &y[..pre_end],
+                model.covariates(),
+                &beta,
+            );
 
             // Step 1b: local_level_seasonal_smoother
             let (states, s1_obs, innovation_ssd) = local_level_seasonal_smoother(
@@ -483,15 +485,14 @@ fn run_single_chain_static(
                         0.01,
                     );
 
-                    let mut residual: Vec<f64> = y[..pre_end]
-                        .iter()
-                        .zip(states.iter())
-                        .zip(s1_obs_pre.iter())
-                        .enumerate()
-                        .map(|(t, ((&y_val, &mu), &s1))| {
-                            y_val - mu - s1 - block_contribution(model.covariates(), &beta, t)
-                        })
-                        .collect();
+                    fill_state_and_seasonal_residual(
+                        &mut residual,
+                        &y[..pre_end],
+                        &states,
+                        &s1_obs_pre,
+                        model.covariates(),
+                        &beta,
+                    );
 
                     sample_spike_and_slab(
                         &mut rng,
@@ -509,12 +510,7 @@ fn run_single_chain_static(
                     let prior = static_regression_prior
                         .as_ref()
                         .expect("static regression prior must exist when k > 0");
-                    // baseline = states + s1
-                    let baseline: Vec<f64> = states
-                        .iter()
-                        .zip(s1_obs_pre.iter())
-                        .map(|(&mu, &s1)| mu + s1)
-                        .collect();
+                    fill_state_plus_seasonality(&mut baseline, &states, &s1_obs_pre);
                     beta = sample_beta_with_normal_prior(
                         &mut rng,
                         &y[..pre_end],
@@ -557,8 +553,7 @@ fn run_single_chain_static(
             }
 
             // Step 3: sigma2_level sampling
-            sigma2_level =
-                sample_sigma2_level(&mut rng, &states, pre_end, prior_level_sd, y_sd);
+            sigma2_level = sample_sigma2_level(&mut rng, &states, pre_end, prior_level_sd, y_sd);
 
             // Step 4: sigma2_seasonal sampling
             sigma2_seasonal = sample_sigma2_seasonal(
@@ -624,10 +619,10 @@ fn run_single_chain_static(
         } else {
             // ── Original non-seasonal path (unchanged) ──
             // Step 1: State sampling (simulation smoother)
-            let y_adj = adjusted_observations(y, model, &beta, &seasonal_beta, pre_end);
+            fill_adjusted_observations(&mut adjusted, y, model, &beta, &seasonal_beta, pre_end);
             let (states, slopes) = sample_state_path(
                 &mut rng,
-                &y_adj,
+                &adjusted,
                 sigma2_obs,
                 sigma2_level,
                 sigma2_slope,
@@ -649,8 +644,14 @@ fn run_single_chain_static(
                     0.01,
                 );
 
-                let mut residual =
-                    user_residual(&y[..pre_end], &states, model, &beta, &seasonal_beta);
+                fill_user_residual(
+                    &mut residual,
+                    &y[..pre_end],
+                    &states,
+                    model,
+                    &beta,
+                    &seasonal_beta,
+                );
 
                 sample_spike_and_slab(
                     &mut rng,
@@ -668,8 +669,12 @@ fn run_single_chain_static(
                     let prior = seasonal_regression_prior
                         .as_ref()
                         .expect("seasonal regression prior must exist");
-                    let baseline =
-                        baseline_from_state_and_block(&states, model.covariates(), &beta);
+                    fill_baseline_from_state_and_block(
+                        &mut baseline,
+                        &states,
+                        model.covariates(),
+                        &beta,
+                    );
                     seasonal_beta = sample_beta_with_normal_prior(
                         &mut rng,
                         &y[..pre_end],
@@ -685,7 +690,8 @@ fn run_single_chain_static(
                     let prior = static_regression_prior
                         .as_ref()
                         .expect("static regression prior must exist when k > 0");
-                    let baseline = baseline_from_state_and_block(
+                    fill_baseline_from_state_and_block(
+                        &mut baseline,
                         &states,
                         model.seasonal_covariates(),
                         &seasonal_beta,
@@ -707,8 +713,12 @@ fn run_single_chain_static(
                     let prior = seasonal_regression_prior
                         .as_ref()
                         .expect("seasonal regression prior must exist");
-                    let baseline =
-                        baseline_from_state_and_block(&states, model.covariates(), &beta);
+                    fill_baseline_from_state_and_block(
+                        &mut baseline,
+                        &states,
+                        model.covariates(),
+                        &beta,
+                    );
                     seasonal_beta = sample_beta_with_normal_prior(
                         &mut rng,
                         &y[..pre_end],
@@ -909,66 +919,122 @@ fn sample_post_period_states_by_state_model<R: rand::Rng>(
     }
 }
 
-fn adjusted_observations(
+fn fill_adjusted_observations(
+    adjusted: &mut [f64],
     y: &[f64],
     model: &StateSpaceModel,
     beta: &[f64],
     seasonal_beta: &[f64],
     pre_end: usize,
-) -> Vec<f64> {
-    y.iter()
-        .take(pre_end)
-        .enumerate()
-        .map(|(t, y_value)| y_value - model.regression_contribution(t, beta, seasonal_beta))
-        .collect()
+) {
+    for (t, adjusted_value) in adjusted.iter_mut().enumerate().take(pre_end) {
+        *adjusted_value = y[t] - model.regression_contribution(t, beta, seasonal_beta);
+    }
 }
 
-/// Adjusted observations for dynamic regression: subtract time-varying x'β_t.
-fn adjusted_observations_dynamic(
+fn fill_adjusted_observations_dynamic(
+    adjusted: &mut [f64],
     y: &[f64],
     model: &StateSpaceModel,
     beta_t: &[Vec<f64>],
     seasonal_beta: &[f64],
     pre_end: usize,
-) -> Vec<f64> {
-    y.iter()
-        .take(pre_end)
-        .enumerate()
-        .map(|(t, y_value)| {
-            let dynamic_reg = if !beta_t.is_empty() && !beta_t[0].is_empty() {
-                block_contribution(model.covariates(), &beta_t[t], t)
-            } else {
-                0.0
-            };
-            let seasonal_reg = block_contribution(model.seasonal_covariates(), seasonal_beta, t);
-            y_value - dynamic_reg - seasonal_reg
-        })
-        .collect()
+) {
+    for (t, adjusted_value) in adjusted.iter_mut().enumerate().take(pre_end) {
+        let dynamic_reg = if !beta_t.is_empty() && !beta_t[0].is_empty() {
+            block_contribution(model.covariates(), &beta_t[t], t)
+        } else {
+            0.0
+        };
+        let seasonal_reg = block_contribution(model.seasonal_covariates(), seasonal_beta, t);
+        *adjusted_value = y[t] - dynamic_reg - seasonal_reg;
+    }
 }
 
-fn baseline_from_state_and_block(states: &[f64], x: &[Vec<f64>], beta: &[f64]) -> Vec<f64> {
-    states
-        .iter()
-        .enumerate()
-        .map(|(t, state)| state + block_contribution(x, beta, t))
-        .collect()
+fn fill_baseline_from_state_and_block(
+    baseline: &mut [f64],
+    states: &[f64],
+    x: &[Vec<f64>],
+    beta: &[f64],
+) {
+    for (t, baseline_value) in baseline.iter_mut().enumerate().take(states.len()) {
+        *baseline_value = states[t] + block_contribution(x, beta, t);
+    }
 }
 
-fn user_residual(
+fn fill_user_residual(
+    residual: &mut [f64],
     y_pre: &[f64],
     states: &[f64],
     model: &StateSpaceModel,
     beta: &[f64],
     seasonal_beta: &[f64],
-) -> Vec<f64> {
-    y_pre
-        .iter()
-        .zip(states.iter())
-        .enumerate()
-        .map(|(t, (y_value, state))| {
-            y_value - state - model.regression_contribution(t, beta, seasonal_beta)
-        })
-        .collect()
+) {
+    for (t, residual_value) in residual.iter_mut().enumerate().take(y_pre.len()) {
+        *residual_value =
+            y_pre[t] - states[t] - model.regression_contribution(t, beta, seasonal_beta);
+    }
+}
+
+fn fill_beta_targets_without_dynamic_regression(
+    beta_targets: &mut [f64],
+    y_pre: &[f64],
+    states: &[f64],
+    seasonal_x: &[Vec<f64>],
+    seasonal_beta: &[f64],
+) {
+    for (t, beta_target) in beta_targets.iter_mut().enumerate().take(y_pre.len()) {
+        *beta_target = y_pre[t] - states[t] - block_contribution(seasonal_x, seasonal_beta, t);
+    }
+}
+
+fn fill_dynamic_baseline(
+    baseline: &mut [f64],
+    states: &[f64],
+    model: &StateSpaceModel,
+    beta_t: &[Vec<f64>],
+) {
+    for (t, baseline_value) in baseline.iter_mut().enumerate().take(states.len()) {
+        *baseline_value = states[t]
+            + if beta_t.is_empty() {
+                0.0
+            } else {
+                block_contribution(model.covariates(), &beta_t[t], t)
+            };
+    }
+}
+
+fn fill_state_residual_from_covariates(
+    residual: &mut [f64],
+    y_pre: &[f64],
+    x: &[Vec<f64>],
+    beta: &[f64],
+) {
+    for (t, residual_value) in residual.iter_mut().enumerate().take(y_pre.len()) {
+        *residual_value = y_pre[t] - block_contribution(x, beta, t);
+    }
+}
+
+fn fill_state_and_seasonal_residual(
+    residual: &mut [f64],
+    y_pre: &[f64],
+    states: &[f64],
+    s1_obs_pre: &[f64],
+    x: &[Vec<f64>],
+    beta: &[f64],
+) {
+    for (t, residual_value) in residual.iter_mut().enumerate().take(y_pre.len()) {
+        *residual_value = y_pre[t] - states[t] - s1_obs_pre[t] - block_contribution(x, beta, t);
+    }
+}
+
+fn fill_state_plus_seasonality(baseline: &mut [f64], states: &[f64], s1_obs_pre: &[f64]) {
+    for (baseline_value, (&state, &seasonality)) in baseline
+        .iter_mut()
+        .zip(states.iter().zip(s1_obs_pre.iter()))
+    {
+        *baseline_value = state + seasonality;
+    }
 }
 
 fn block_contribution(x: &[Vec<f64>], beta: &[f64], t: usize) -> f64 {
@@ -1505,7 +1571,7 @@ fn generate_predictions_seasonal<R: rand::Rng>(
 /// Whether a post-period time step is a season boundary.
 #[inline]
 fn is_season_boundary_post(t: usize, season_duration: usize) -> bool {
-    t % season_duration == 0
+    t.is_multiple_of(season_duration)
 }
 
 #[cfg(test)]
@@ -1516,7 +1582,7 @@ mod tests {
     fn test_run_sampler_basic() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
         let result = run_sampler(
-            y,
+            &y,
             vec![],
             15,
             10,
@@ -1543,7 +1609,7 @@ mod tests {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
         let result = run_sampler(
-            y,
+            &y,
             vec![x1],
             15,
             10,
@@ -1567,7 +1633,7 @@ mod tests {
     #[test]
     fn test_run_sampler_empty_y() {
         let result = run_sampler(
-            vec![],
+            &[],
             vec![],
             0,
             10,
@@ -1588,7 +1654,7 @@ mod tests {
     fn test_run_sampler_pre_end_equals_t() {
         let y: Vec<f64> = vec![1.0, 2.0, 3.0];
         let result = run_sampler(
-            y,
+            &y,
             vec![],
             3,
             10,
@@ -1611,7 +1677,7 @@ mod tests {
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
         // k>0 with expected_model_size=0 should fail (static only)
         let result = run_sampler(
-            y.clone(),
+            &y,
             vec![x1.clone()],
             15,
             10,
@@ -1628,7 +1694,7 @@ mod tests {
         assert!(result.is_err());
         // k>0 with negative should fail
         let result = run_sampler(
-            y,
+            &y,
             vec![x1],
             15,
             10,
@@ -1689,7 +1755,7 @@ mod tests {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.5 * i as f64).collect();
         let x1: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
         let result = run_sampler(
-            y,
+            &y,
             vec![x1],
             15,
             10,
@@ -1714,7 +1780,7 @@ mod tests {
     fn test_run_sampler_dynamic_regression_k0_same_as_static() {
         let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
         let result_dyn = run_sampler(
-            y.clone(),
+            &y,
             vec![],
             15,
             10,
@@ -1730,7 +1796,7 @@ mod tests {
         )
         .unwrap();
         let result_static = run_sampler(
-            y,
+            &y,
             vec![],
             15,
             10,
@@ -1757,7 +1823,7 @@ mod tests {
         let y: Vec<f64> = (0..30).map(|i| 5.0 + (i as f64 * 0.1).sin()).collect();
         let x1: Vec<f64> = (0..30).map(|i| (i as f64 * 0.2).cos()).collect();
         let result = run_sampler(
-            y,
+            &y,
             vec![x1],
             20,
             20,
@@ -1783,7 +1849,7 @@ mod tests {
     fn test_run_sampler_local_linear_trend_predictions_follow_post_period_length() {
         let y: Vec<f64> = (0..24).map(|i| 10.0 + 0.3 * i as f64).collect();
         let result = run_sampler(
-            y,
+            &y,
             vec![],
             18,
             20,

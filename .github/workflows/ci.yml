@@ -22,6 +22,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Run clippy perf checks
+        run: cargo clippy --lib -- -W clippy::perf
       - name: Run Rust tests
         run: cargo test
 

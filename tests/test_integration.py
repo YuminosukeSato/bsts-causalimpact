@@ -1,6 +1,7 @@
 """Integration tests: end-to-end and R numerical compatibility."""
 
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -304,3 +305,54 @@ class TestPerformance:
         elapsed = time.time() - start
         assert elapsed < 10.0, f"Took {elapsed:.1f}s, should be < 10s"
         assert ci.summary() is not None
+
+
+class TestRustBoundaryDispatch:
+    """Rust境界の入力形式."""
+
+    def test_causal_impact_passes_numpy_arrays_because_the_main_path_should_use_the_rust_fast_path_instead_of_rebuilding_python_lists(  # noqa: E501
+        self,
+        monkeypatch,
+    ):
+        captured: dict[str, object] = {}
+
+        def fake_run_gibbs_sampler(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                states=[[0.0, 0.0, 0.0, 0.0]],
+                sigma_obs=[1.0],
+                sigma_level=[1.0],
+                sigma_seasonal=[],
+                beta=[[]],
+                gamma=[],
+                predictions=[[0.0]],
+            )
+
+        monkeypatch.setattr(
+            "causal_impact.main.run_gibbs_sampler",
+            fake_run_gibbs_sampler,
+        )
+
+        data = np.array(
+            [
+                [1.0, 0.1],
+                [1.1, 0.2],
+                [1.2, 0.3],
+                [1.3, 0.4],
+            ],
+            dtype=np.float64,
+        )
+
+        CausalImpact(
+            data,
+            [0, 2],
+            [3, 3],
+            model_args={"niter": 1, "nwarmup": 0, "seed": 7},
+        )
+
+        assert isinstance(captured["y"], np.ndarray)
+        assert captured["y"].dtype == np.float64
+        assert captured["y"].ndim == 1
+        assert isinstance(captured["x"], np.ndarray)
+        assert captured["x"].dtype == np.float64
+        assert captured["x"].ndim == 2

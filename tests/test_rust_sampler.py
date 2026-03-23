@@ -1,5 +1,6 @@
 """Tests for the Rust Gibbs sampler via PyO3 binding."""
 
+import numpy as np
 import pytest
 from causal_impact._core import GibbsSamples, run_gibbs_sampler
 
@@ -173,6 +174,33 @@ class TestSamplerCovariates:
             prior_level_sd=0.01,
         )
         assert len(result.beta[0]) == 1
+
+    def test_sampler_accepts_numpy_arrays_because_the_python_api_should_hit_the_borrowed_fast_path_and_match_list_inputs(  # noqa: E501
+        self,
+    ):
+        y = np.array([10.0 + 0.5 * i for i in range(30)], dtype=np.float64)
+        x = np.ascontiguousarray([[0.1 * i for i in range(30)]], dtype=np.float64)
+        kwargs = dict(
+            pre_end=20,
+            niter=10,
+            nwarmup=5,
+            nchains=1,
+            seed=42,
+            prior_level_sd=0.01,
+        )
+
+        result_from_numpy = run_gibbs_sampler(y=y, x=x, **kwargs)
+        result_from_lists = run_gibbs_sampler(
+            y=y.tolist(),
+            x=[x[0].tolist()],
+            **kwargs,
+        )
+
+        assert result_from_numpy.states == result_from_lists.states
+        assert result_from_numpy.sigma_obs == result_from_lists.sigma_obs
+        assert result_from_numpy.sigma_level == result_from_lists.sigma_level
+        assert result_from_numpy.beta == result_from_lists.beta
+        assert result_from_numpy.predictions == result_from_lists.predictions
 
 
 class TestSamplerBoundary:

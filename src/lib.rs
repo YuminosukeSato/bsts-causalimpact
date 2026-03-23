@@ -1,10 +1,14 @@
+use numpy::ndarray::Axis;
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::PyAny;
 
 mod distributions;
 mod kalman;
 mod sampler;
 mod state_space;
+
+const MODULE_VERSION: &str = "1.3.0";
 
 #[pyclass(skip_from_py_object)]
 #[derive(Clone)]
@@ -45,8 +49,8 @@ pub struct GibbsSamples {
 )]
 #[allow(clippy::too_many_arguments)]
 fn run_gibbs_sampler(
-    y: Vec<f64>,
-    x: Option<&Bound<'_, PyList>>,
+    y: &Bound<'_, PyAny>,
+    x: Option<&Bound<'_, PyAny>>,
     pre_end: usize,
     niter: usize,
     nwarmup: usize,
@@ -59,20 +63,12 @@ fn run_gibbs_sampler(
     dynamic_regression: bool,
     state_model: &str,
 ) -> PyResult<GibbsSamples> {
-    let x_vecs: Vec<Vec<f64>> = match x {
-        Some(list) => {
-            let mut cols = Vec::new();
-            for item in list.iter() {
-                let col: Vec<f64> = item.extract()?;
-                cols.push(col);
-            }
-            cols
-        }
-        None => vec![],
-    };
+    let y_values = extract_series(y)?;
+    let y_slice = y_values.as_slice()?;
+    let x_vecs = extract_covariates(x)?;
 
     let result = sampler::run_sampler(
-        y,
+        y_slice,
         x_vecs,
         pre_end,
         niter,
@@ -99,11 +95,50 @@ fn run_gibbs_sampler(
     })
 }
 
+enum SeriesInput<'py> {
+    Borrowed(PyReadonlyArray1<'py, f64>),
+    Owned(Vec<f64>),
+}
+
+impl<'py> SeriesInput<'py> {
+    fn as_slice(&self) -> PyResult<&[f64]> {
+        match self {
+            Self::Borrowed(array) => Ok(array.as_slice()?),
+            Self::Owned(values) => Ok(values.as_slice()),
+        }
+    }
+}
+
+fn extract_series<'py>(value: &Bound<'py, PyAny>) -> PyResult<SeriesInput<'py>> {
+    if let Ok(array) = value.extract::<PyReadonlyArray1<'py, f64>>() {
+        return Ok(SeriesInput::Borrowed(array));
+    }
+
+    Ok(SeriesInput::Owned(value.extract::<Vec<f64>>()?))
+}
+
+fn extract_covariates(value: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Vec<f64>>> {
+    let Some(value) = value else {
+        return Ok(vec![]);
+    };
+
+    if let Ok(array) = value.extract::<PyReadonlyArray2<'_, f64>>() {
+        let view = array.as_array();
+        let mut cols = Vec::with_capacity(view.nrows());
+        for row in view.axis_iter(Axis(0)) {
+            cols.push(row.to_vec());
+        }
+        return Ok(cols);
+    }
+
+    value.extract::<Vec<Vec<f64>>>()
+}
+
 /// CausalImpact Rust core module.
 /// Provides Gibbs sampler for Bayesian structural time series.
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "1.1.0")?;
+    m.add("__version__", MODULE_VERSION)?;
     m.add_class::<GibbsSamples>()?;
     m.add_function(wrap_pyfunction!(run_gibbs_sampler, m)?)?;
     Ok(())

@@ -458,38 +458,44 @@ fn mv_kalman_smoother(
     // Initial state: a_0|0 = 0, P_0|0 = init_var * I
     let mut a_pred = vec![0.0; k];
     let mut p_pred = vec![vec![0.0; k]; k];
+    let mut p_x = vec![0.0; k];
+    let mut k_gain = vec![0.0; k];
+    let mut p_pred_next = vec![vec![0.0; k]; k];
+    let mut delta = vec![0.0; k];
     for (j, row) in p_pred.iter_mut().enumerate() {
         row[j] = init_var;
     }
 
     // Forward filter
     for i in 0..t {
-        // x_t vector at time i
-        let x_t: Vec<f64> = x.iter().map(|col| col[i]).collect();
-
         // Innovation: v_t = y_t - x_t' a_{t|t-1}
-        let v: f64 = y[i]
-            - x_t
-                .iter()
-                .zip(&a_pred)
-                .map(|(&xi, &ai)| xi * ai)
-                .sum::<f64>();
+        let predicted_observation = x
+            .iter()
+            .zip(a_pred.iter())
+            .map(|(x_col, &a_i)| x_col[i] * a_i)
+            .sum::<f64>();
+        let v = y[i] - predicted_observation;
 
         // Innovation variance: F_t = x_t' P_{t|t-1} x_t + σ²_obs (scalar)
-        let p_x: Vec<f64> = (0..k)
-            .map(|j| {
-                p_pred[j]
-                    .iter()
-                    .zip(&x_t)
-                    .map(|(&p, &xi)| p * xi)
-                    .sum::<f64>()
-            })
-            .collect();
-        let f_t: f64 = x_t.iter().zip(&p_x).map(|(&xi, &px)| xi * px).sum::<f64>() + sigma2_obs;
+        for j in 0..k {
+            p_x[j] = p_pred[j]
+                .iter()
+                .zip(x.iter())
+                .map(|(&p, x_col)| p * x_col[i])
+                .sum::<f64>();
+        }
+        let f_t = x
+            .iter()
+            .zip(p_x.iter())
+            .map(|(x_col, &px)| x_col[i] * px)
+            .sum::<f64>()
+            + sigma2_obs;
         let f_inv = 1.0 / f_t.max(F_MIN);
 
         // Kalman gain: K_t = P_{t|t-1} x_t / F_t  (k-vector)
-        let k_gain: Vec<f64> = p_x.iter().map(|&px| px * f_inv).collect();
+        for j in 0..k {
+            k_gain[j] = p_x[j] * f_inv;
+        }
 
         // Update: a_{t|t} = a_{t|t-1} + K_t v_t
         for j in 0..k {
@@ -502,9 +508,9 @@ fn mv_kalman_smoother(
             for col in 0..k {
                 let mut val = 0.0;
                 for m in 0..k {
-                    let i_kx_rm = if row == m { 1.0 } else { 0.0 } - k_gain[row] * x_t[m];
+                    let i_kx_rm = if row == m { 1.0 } else { 0.0 } - k_gain[row] * x[m][i];
                     for n in 0..k {
-                        let i_kx_cn = if col == n { 1.0 } else { 0.0 } - k_gain[col] * x_t[n];
+                        let i_kx_cn = if col == n { 1.0 } else { 0.0 } - k_gain[col] * x[n][i];
                         val += i_kx_rm * p_pred[m][n] * i_kx_cn;
                     }
                 }
@@ -517,8 +523,8 @@ fn mv_kalman_smoother(
         symmetrize_and_floor(&mut p_filt[i], k);
 
         // Predict next step: a_{t+1|t} = a_{t|t}, P_{t+1|t} = P_{t|t} + Q
-        a_pred = a_filt[i].clone();
-        p_pred = p_filt[i].clone();
+        a_pred.clone_from(&a_filt[i]);
+        p_pred.clone_from(&p_filt[i]);
         for j in 0..k {
             p_pred[j][j] += q_diag[j];
         }
@@ -534,16 +540,18 @@ fn mv_kalman_smoother(
 
     for i in (0..t - 1).rev() {
         // P_{t+1|t} = P_{t|t} + Q
-        let mut p_pred_next = p_filt[i].clone();
+        p_pred_next.clone_from(&p_filt[i]);
         for j in 0..k {
             p_pred_next[j][j] += q_diag[j];
         }
 
         // d = β̂_{t+1} - a_{t|t}
-        let d: Vec<f64> = (0..k).map(|j| beta_hat[i + 1][j] - a_filt[i][j]).collect();
+        for j in 0..k {
+            delta[j] = beta_hat[i + 1][j] - a_filt[i][j];
+        }
 
         // z = solve(P_{t+1|t}, d) via Cholesky
-        let z = cholesky_solve(&p_pred_next, &d, k);
+        let z = cholesky_solve(&p_pred_next, &delta, k);
 
         // β̂_t = a_{t|t} + P_{t|t} @ z
         for j in 0..k {
@@ -657,10 +665,7 @@ pub fn local_level_seasonal_smoother<R: Rng>(
     }
 
     // Center observations around initial_state_mean (Jarociński fix: a1=0)
-    let centered_y: Vec<f64> = y_residual
-        .iter()
-        .map(|v| v - initial_state_mean)
-        .collect();
+    let centered_y: Vec<f64> = y_residual.iter().map(|v| v - initial_state_mean).collect();
 
     // Initial state variance for seasonal components
     let seasonal_init_var = initial_state_var;
@@ -671,35 +676,34 @@ pub fn local_level_seasonal_smoother<R: Rng>(
 
     // α⁺_0 ~ N(0, diag(init_var, seasonal_init_var, ...))
     alpha_plus[0][0] = sample_normal(rng, 0.0, initial_state_var);
-    for j in 1..s {
-        alpha_plus[0][j] = sample_normal(rng, 0.0, seasonal_init_var);
+    for alpha in alpha_plus[0].iter_mut().take(s).skip(1) {
+        *alpha = sample_normal(rng, 0.0, seasonal_init_var);
     }
     // y⁺_0 = Z α⁺_0 + ε⁺ = α⁺[0][0] + α⁺[0][1] + ε⁺
     y_plus[0] = alpha_plus[0][0] + alpha_plus[0][1] + sample_normal(rng, 0.0, sigma2_obs);
 
     for i in 1..t {
-        // Copy previous state to avoid borrow conflict
-        let prev: Vec<f64> = alpha_plus[i - 1].clone();
+        let (prev_rows, current_and_rest) = alpha_plus.split_at_mut(i);
+        let prev = &prev_rows[i - 1];
+        let current = &mut current_and_rest[0];
 
         // Level: random walk
-        alpha_plus[i][0] = prev[0] + sample_normal(rng, 0.0, sigma2_level);
+        current[0] = prev[0] + sample_normal(rng, 0.0, sigma2_level);
 
         if is_season_boundary(i, season_duration) {
             // Seasonal transition: s_1(t) = -Σ s_j(t-1) + η_seasonal
             let seasonal_sum: f64 = prev[1..s].iter().sum();
-            alpha_plus[i][1] = -seasonal_sum + sample_normal(rng, 0.0, sigma2_seasonal);
+            current[1] = -seasonal_sum + sample_normal(rng, 0.0, sigma2_seasonal);
             // s_j(t) = s_{j-1}(t-1) for j >= 2
-            for j in 2..s {
-                alpha_plus[i][j] = prev[j - 1];
+            if s > 2 {
+                current[2..s].copy_from_slice(&prev[1..(s - 1)]);
             }
         } else {
             // Intra-season: seasonal state unchanged
-            for j in 1..s {
-                alpha_plus[i][j] = prev[j];
-            }
+            current[1..s].copy_from_slice(&prev[1..s]);
         }
 
-        y_plus[i] = alpha_plus[i][0] + alpha_plus[i][1] + sample_normal(rng, 0.0, sigma2_obs);
+        y_plus[i] = current[0] + current[1] + sample_normal(rng, 0.0, sigma2_obs);
     }
 
     // Step 2: y* = centered_y - y⁺
@@ -732,22 +736,13 @@ pub fn local_level_seasonal_smoother<R: Rng>(
 
     // Compute innovation_ssd: Σ (η_{s,t})² at season boundaries
     // η_{s,t} = s_1(t) - expected_s1 = s_1(t) - (-Σ_{j=1}^{S-1} s_j(t-1))
-    let full_states: Vec<Vec<f64>> = (0..t)
-        .map(|i| {
-            let mut state = vec![0.0; s];
-            state[0] = alpha_hat[i][0] + alpha_plus[i][0];
-            for j in 1..s {
-                state[j] = alpha_hat[i][j] + alpha_plus[i][j];
-            }
-            state
-        })
-        .collect();
-
     let mut innovation_ssd = 0.0;
     for i in 1..t {
         if is_season_boundary(i, season_duration) {
-            let expected_s1: f64 = -full_states[i - 1][1..s].iter().sum::<f64>();
-            let eta = full_states[i][1] - expected_s1;
+            let expected_s1 = -(1..s)
+                .map(|j| alpha_hat[i - 1][j] + alpha_plus[i - 1][j])
+                .sum::<f64>();
+            let eta = alpha_hat[i][1] + alpha_plus[i][1] - expected_s1;
             innovation_ssd += eta * eta;
         }
     }
@@ -758,7 +753,7 @@ pub fn local_level_seasonal_smoother<R: Rng>(
 /// Whether time step t is a season boundary.
 #[inline]
 fn is_season_boundary(t: usize, season_duration: usize) -> bool {
-    t % season_duration == 0
+    t.is_multiple_of(season_duration)
 }
 
 /// S-dimensional Kalman filter + RTS smoother for local level + seasonal model.
@@ -807,9 +802,9 @@ fn seasonal_kalman_smoother(
 
     // Initial state: a_{1|0} = 0, P_{1|0} = diag(init_level_var, init_seasonal_var, ...)
     // a_pred_flat[0..s] is already zero-initialized
-    p_pred_flat[0 * ss + 0 * s + 0] = initial_level_var.max(F_MIN);
+    p_pred_flat[0] = initial_level_var.max(F_MIN);
     for j in 1..s {
-        p_pred_flat[0 * ss + j * s + j] = initial_seasonal_var.max(F_MIN);
+        p_pred_flat[j * s + j] = initial_seasonal_var.max(F_MIN);
     }
 
     // Forward Kalman filter
@@ -897,9 +892,7 @@ fn seasonal_kalman_smoother(
         apply_state_transition_transpose_inplace(&r, s, next_is_boundary, &mut t_prime_r);
 
         // K_filter . (T' r): dot product of Kalman gain with T' r
-        let k_dot_tpr: f64 = (0..s)
-            .map(|j| k_store_flat[k_off + j] * t_prime_r[j])
-            .sum();
+        let k_dot_tpr: f64 = (0..s).map(|j| k_store_flat[k_off + j] * t_prime_r[j]).sum();
 
         // r_{i-1}[j] = Z'[j]/F_i * v_i + (T' r)[j] - Z'[j] * (K_filter . T' r)
         let v_over_f = v_store[i] / f_store[i];
@@ -915,9 +908,7 @@ fn seasonal_kalman_smoother(
         // Flat contiguous access for cache efficiency
         for j in 0..s {
             let row_off = p_off + j * s;
-            let correction: f64 = (0..s)
-                .map(|m| p_pred_flat[row_off + m] * r[m])
-                .sum();
+            let correction: f64 = (0..s).map(|m| p_pred_flat[row_off + m] * r[m]).sum();
             smooth[i][j] = a_pred_flat[a_off + j] + correction;
         }
     }
@@ -935,12 +926,7 @@ fn apply_state_transition(state: &[f64], s: usize, is_boundary: bool) -> Vec<f64
 }
 
 /// In-place variant: writes T * state into `out`.
-fn apply_state_transition_inplace(
-    state: &[f64],
-    s: usize,
-    is_boundary: bool,
-    out: &mut [f64],
-) {
+fn apply_state_transition_inplace(state: &[f64], s: usize, is_boundary: bool, out: &mut [f64]) {
     // Level: always random walk
     out[0] = state[0];
 
@@ -1112,8 +1098,8 @@ fn joseph_form_update_inplace(
 
     for i in 0..s {
         for j in 0..=i {
-            let val = p_pred[i][j] - k_gain[i] * v[j] - v[i] * k_gain[j]
-                + k_gain[i] * k_gain[j] * f;
+            let val =
+                p_pred[i][j] - k_gain[i] * v[j] - v[i] * k_gain[j] + k_gain[i] * k_gain[j] * f;
             out[i][j] = val;
             out[j][i] = val;
         }
@@ -1273,7 +1259,9 @@ pub fn count_season_boundaries(t_end: usize, season_duration: usize) -> usize {
     }
     // Boundaries at t=1, 2, ..., t_end-1 where t % season_duration == 0
     // t=0 is not a boundary (it's initial)
-    (1..t_end).filter(|&t| is_season_boundary(t, season_duration)).count()
+    (1..t_end)
+        .filter(|&t| is_season_boundary(t, season_duration))
+        .count()
 }
 
 #[cfg(test)]
@@ -1529,9 +1517,8 @@ mod tests {
         let mut mean_s1 = vec![0.0; 56];
         for seed in 0..n_samples {
             let mut rng = StdRng::seed_from_u64(seed as u64);
-            let (_, s1_obs, _) = local_level_seasonal_smoother(
-                &mut rng, &y, 0.01, 0.001, 0.01, 7, 1, 0.0, 1.0,
-            );
+            let (_, s1_obs, _) =
+                local_level_seasonal_smoother(&mut rng, &y, 0.01, 0.001, 0.01, 7, 1, 0.0, 1.0);
             for (mean, &s) in mean_s1.iter_mut().zip(s1_obs.iter()) {
                 *mean += s / n_samples as f64;
             }
@@ -1561,9 +1548,8 @@ mod tests {
         let mut mean_s1 = vec![0.0; 28];
         for seed in 0..n_samples {
             let mut rng = StdRng::seed_from_u64(seed as u64);
-            let (_, s1_obs, _) = local_level_seasonal_smoother(
-                &mut rng, &y, 1.0, 0.01, 0.001, 7, 1, 5.0, 1.0,
-            );
+            let (_, s1_obs, _) =
+                local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.001, 7, 1, 5.0, 1.0);
             for (mean, &s) in mean_s1.iter_mut().zip(s1_obs.iter()) {
                 *mean += s / n_samples as f64;
             }
@@ -1588,13 +1574,9 @@ mod tests {
         let mut mean_fit = vec![0.0; 20];
         for seed in 0..n_samples {
             let mut rng = StdRng::seed_from_u64(seed as u64);
-            let (levels, s1_obs, _) = local_level_seasonal_smoother(
-                &mut rng, &y, 1e-8, 0.001, 0.01, 5, 1, 0.0, 1.0,
-            );
-            for (mean, (l, s)) in mean_fit
-                .iter_mut()
-                .zip(levels.iter().zip(s1_obs.iter()))
-            {
+            let (levels, s1_obs, _) =
+                local_level_seasonal_smoother(&mut rng, &y, 1e-8, 0.001, 0.01, 5, 1, 0.0, 1.0);
+            for (mean, (l, s)) in mean_fit.iter_mut().zip(levels.iter().zip(s1_obs.iter())) {
                 *mean += (l + s) / n_samples as f64;
             }
         }
@@ -1616,7 +1598,11 @@ mod tests {
         let y: Vec<f64> = (0..14).map(|i| (i % 7) as f64).collect();
         let (_, _, ssd) =
             local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.01, 7, 1, 0.0, 1.0);
-        assert!(ssd >= 0.0, "innovation_ssd must be non-negative, got {}", ssd);
+        assert!(
+            ssd >= 0.0,
+            "innovation_ssd must be non-negative, got {}",
+            ssd
+        );
     }
 
     #[test]
@@ -1637,7 +1623,15 @@ mod tests {
             );
             let mut rng2 = StdRng::seed_from_u64(seed as u64 + 1000);
             let (_, _, ssd2) = local_level_seasonal_smoother(
-                &mut rng2, &y_changing, 0.1, 0.001, 0.01, 7, 1, 0.0, 1.0,
+                &mut rng2,
+                &y_changing,
+                0.1,
+                0.001,
+                0.01,
+                7,
+                1,
+                0.0,
+                1.0,
             );
             ssd_stable_sum += ssd1;
             ssd_changing_sum += ssd2;
@@ -1658,10 +1652,16 @@ mod tests {
         let (levels, s1_obs, ssd) =
             local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.0, 3, 1, 0.0, 1.0);
         for &v in &levels {
-            assert!(v.is_finite(), "levels should be finite when sigma2_seasonal=0");
+            assert!(
+                v.is_finite(),
+                "levels should be finite when sigma2_seasonal=0"
+            );
         }
         for &v in &s1_obs {
-            assert!(v.is_finite(), "s1_obs should be finite when sigma2_seasonal=0");
+            assert!(
+                v.is_finite(),
+                "s1_obs should be finite when sigma2_seasonal=0"
+            );
         }
         assert!(ssd.is_finite());
     }
@@ -1670,14 +1670,19 @@ mod tests {
     fn test_lls_finite_sigma2_obs_tiny() {
         let mut rng = StdRng::seed_from_u64(42);
         let y = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
-        let (levels, s1_obs, _) = local_level_seasonal_smoother(
-            &mut rng, &y, 1e-12, 0.01, 0.01, 7, 1, 0.0, 1.0,
-        );
+        let (levels, s1_obs, _) =
+            local_level_seasonal_smoother(&mut rng, &y, 1e-12, 0.01, 0.01, 7, 1, 0.0, 1.0);
         for &v in &levels {
-            assert!(v.is_finite(), "levels should be finite with tiny sigma2_obs");
+            assert!(
+                v.is_finite(),
+                "levels should be finite with tiny sigma2_obs"
+            );
         }
         for &v in &s1_obs {
-            assert!(v.is_finite(), "s1_obs should be finite with tiny sigma2_obs");
+            assert!(
+                v.is_finite(),
+                "s1_obs should be finite with tiny sigma2_obs"
+            );
         }
     }
 
@@ -1685,9 +1690,8 @@ mod tests {
     fn test_lls_finite_init_var_large() {
         let mut rng = StdRng::seed_from_u64(42);
         let y = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
-        let (levels, s1_obs, _) = local_level_seasonal_smoother(
-            &mut rng, &y, 1.0, 0.01, 0.01, 7, 1, 0.0, 1e6,
-        );
+        let (levels, s1_obs, _) =
+            local_level_seasonal_smoother(&mut rng, &y, 1.0, 0.01, 0.01, 7, 1, 0.0, 1e6);
         for &v in &levels {
             assert!(v.is_finite(), "levels should be finite with large init_var");
         }
@@ -2169,7 +2173,10 @@ mod tests {
     fn test_joseph_form_result_is_symmetric_s12() {
         let (p, k, obs) = make_joseph_test_data(12, 205);
         let result = joseph_form_update(&p, &k, obs, 12);
-        assert!(is_symmetric(&result, 1e-12), "Joseph form result should be symmetric");
+        assert!(
+            is_symmetric(&result, 1e-12),
+            "Joseph form result should be symmetric"
+        );
     }
 
     #[test]
@@ -2234,7 +2241,9 @@ mod tests {
         // Run smoother, verify output lengths and finite values
         // (R compatibility is tested at Python level via test_numerical_equivalence.py)
         let mut rng = StdRng::seed_from_u64(302);
-        let y: Vec<f64> = (0..100).map(|i| ((i % 12) as f64 - 5.5) * 0.3 + 10.0).collect();
+        let y: Vec<f64> = (0..100)
+            .map(|i| ((i % 12) as f64 - 5.5) * 0.3 + 10.0)
+            .collect();
         let (levels, s1_obs, ssd) =
             local_level_seasonal_smoother(&mut rng, &y, 0.5, 0.01, 0.01, 12, 1, 10.0, 1.0);
         assert_eq!(levels.len(), 100);
@@ -2298,7 +2307,11 @@ mod tests {
             .zip(actual.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        assert!(diff_b < 1e-15, "inplace transition boundary s=7: diff = {}", diff_b);
+        assert!(
+            diff_b < 1e-15,
+            "inplace transition boundary s=7: diff = {}",
+            diff_b
+        );
         // Non-boundary
         let expected_nb = apply_state_transition(&state, 7, false);
         apply_state_transition_inplace(&state, 7, false, &mut actual);
@@ -2307,7 +2320,11 @@ mod tests {
             .zip(actual.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        assert!(diff_nb < 1e-15, "inplace transition non-boundary s=7: diff = {}", diff_nb);
+        assert!(
+            diff_nb < 1e-15,
+            "inplace transition non-boundary s=7: diff = {}",
+            diff_nb
+        );
     }
 
     #[test]
@@ -2321,14 +2338,23 @@ mod tests {
         // Run seasonal_kalman_smoother with degenerate inputs
         let y = vec![1.0, 2.0, 3.0, 4.0];
         let result = seasonal_kalman_smoother(
-            &y, sigma2_obs, sigma2_level, sigma2_seasonal, s, 1, F_MIN, F_MIN,
+            &y,
+            sigma2_obs,
+            sigma2_level,
+            sigma2_seasonal,
+            s,
+            1,
+            F_MIN,
+            F_MIN,
         );
         for (i, row) in result.iter().enumerate() {
             for (j, &val) in row.iter().enumerate() {
                 assert!(
                     val.is_finite(),
                     "smooth[{}][{}] = {} not finite with degenerate inputs",
-                    i, j, val
+                    i,
+                    j,
+                    val
                 );
             }
         }
@@ -2344,8 +2370,7 @@ mod tests {
         let t = 50;
         let y: Vec<f64> = (0..t).map(|i| ((i % s) as f64 - 5.5) * 0.5).collect();
         let current = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
-        let reference =
-            seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
+        let reference = seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
         let diff = max_abs_diff(&current, &reference);
         // DK r_t and RTS Cholesky take different numerical paths; tolerance
         // scales with s and T. s=12, T=50 yields ~2e-8 difference.
@@ -2398,8 +2423,7 @@ mod tests {
             p_pred_store[i] = p_pred.clone();
 
             let v = y[i] - a_pred[0] - a_pred[1];
-            let f_t =
-                (p_pred[0][0] + 2.0 * p_pred[0][1] + p_pred[1][1] + sigma2_obs).max(F_MIN);
+            let f_t = (p_pred[0][0] + 2.0 * p_pred[0][1] + p_pred[1][1] + sigma2_obs).max(F_MIN);
             let f_inv = 1.0 / f_t;
 
             let k_gain: Vec<f64> = (0..s)
@@ -2532,9 +2556,7 @@ mod tests {
             .map(|i| ((i % 168) as f64 - 83.5) * 0.05)
             .collect();
         // s=168, T=1200: FP difference ~1e-5, well within R compat ±1% tolerance
-        assert_dk_matches_rts(
-            &y, 0.5, 0.01, 0.01, 168, 1, 1.0, 1.0, 1e-3, "s168_t1200",
-        );
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 168, 1, 1.0, 1.0, 1e-3, "s168_t1200");
     }
 
     // ─── PR-C: DK r recursion correctness tests (5 tests) ───
@@ -2554,12 +2576,7 @@ mod tests {
     }
 
     /// Naive L' r computation: L = T - K_DK Z, K_DK = T K_filter, L' r = (I - Z' K') T' r
-    fn naive_l_prime_r(
-        k_filter: &[f64],
-        r: &[f64],
-        s: usize,
-        is_boundary: bool,
-    ) -> Vec<f64> {
+    fn naive_l_prime_r(k_filter: &[f64], r: &[f64], s: usize, is_boundary: bool) -> Vec<f64> {
         // Build full L matrix (s×s):
         // L = T - K_DK Z = T - T K_filter Z
         // L[i][j] = T[i][j] - (T K_filter)[i] * Z[j]
@@ -2587,14 +2604,13 @@ mod tests {
 
     /// Efficient L' r (the formula used in seasonal_kalman_smoother):
     /// L' r = T' r - Z' (K_filter . T' r)
-    fn efficient_l_prime_r(
-        k_filter: &[f64],
-        r: &[f64],
-        s: usize,
-        is_boundary: bool,
-    ) -> Vec<f64> {
+    fn efficient_l_prime_r(k_filter: &[f64], r: &[f64], s: usize, is_boundary: bool) -> Vec<f64> {
         let t_prime_r = apply_state_transition_transpose(r, s, is_boundary);
-        let k_dot_tpr: f64 = k_filter.iter().zip(t_prime_r.iter()).map(|(&k, &tr)| k * tr).sum();
+        let k_dot_tpr: f64 = k_filter
+            .iter()
+            .zip(t_prime_r.iter())
+            .map(|(&k, &tr)| k * tr)
+            .sum();
         let mut result = vec![0.0; s];
         for j in 0..s {
             if j < 2 {
@@ -2659,9 +2675,7 @@ mod tests {
         // Run the full smoother and verify all output values are finite
         let s = 168;
         let t = 1200;
-        let y: Vec<f64> = (0..t)
-            .map(|i| ((i % s) as f64 - 83.5) * 0.05)
-            .collect();
+        let y: Vec<f64> = (0..t).map(|i| ((i % s) as f64 - 83.5) * 0.05).collect();
         let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
         for i in 0..t {
             for j in 0..s {
@@ -2702,9 +2716,7 @@ mod tests {
 
     #[test]
     fn test_dk_smooth_finite_s168() {
-        let y: Vec<f64> = (0..500)
-            .map(|i| ((i % 168) as f64 - 83.5) * 0.02)
-            .collect();
+        let y: Vec<f64> = (0..500).map(|i| ((i % 168) as f64 - 83.5) * 0.02).collect();
         let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 168, 1, 1.0, 1.0);
         for (i, row) in result.iter().enumerate() {
             for (j, &val) in row.iter().enumerate() {
@@ -2720,7 +2732,9 @@ mod tests {
 
     #[test]
     fn test_dk_smoother_r_compatible_s12_t100() {
-        let y: Vec<f64> = (0..100).map(|i| ((i % 12) as f64 - 5.5) * 0.3 + 10.0).collect();
+        let y: Vec<f64> = (0..100)
+            .map(|i| ((i % 12) as f64 - 5.5) * 0.3 + 10.0)
+            .collect();
         let dk = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 12, 1, 10.0, 1.0);
         let rts = seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, 12, 1, 10.0, 1.0);
         let diff = max_abs_diff(&dk, &rts);
@@ -2738,8 +2752,7 @@ mod tests {
             .map(|i| ((i % 168) as f64 - 83.5) * 0.05 + 100.0)
             .collect();
         let dk = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 168, 1, 100.0, 1.0);
-        let rts =
-            seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, 168, 1, 100.0, 1.0);
+        let rts = seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, 168, 1, 100.0, 1.0);
         let diff = max_abs_diff(&dk, &rts);
         // Signal scale ~100, diff ~1e-5 → relative ~1e-7, well within ±1%
         assert!(
@@ -2762,7 +2775,11 @@ mod tests {
             assert!(v.is_finite());
         }
         // With a_pred = [0,0,0,0] and y=3, smoothed level should be positive
-        assert!(result[0][0] > 0.0, "level should be positive for y=3, got {}", result[0][0]);
+        assert!(
+            result[0][0] > 0.0,
+            "level should be positive for y=3, got {}",
+            result[0][0]
+        );
     }
 
     #[test]
@@ -2773,7 +2790,13 @@ mod tests {
         let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 4, 1, 1.0, 1.0);
         for (i, row) in result.iter().enumerate() {
             for (j, &val) in row.iter().enumerate() {
-                assert!(val.is_finite(), "zero innov: smooth[{}][{}] = {}", i, j, val);
+                assert!(
+                    val.is_finite(),
+                    "zero innov: smooth[{}][{}] = {}",
+                    i,
+                    j,
+                    val
+                );
             }
         }
         // With zero observations and zero initial state, smoothed should be near zero
@@ -2813,7 +2836,9 @@ mod tests {
                 assert!(
                     val.is_finite(),
                     "dur7: smooth[{}][{}] = {} not finite",
-                    i, j, val
+                    i,
+                    j,
+                    val
                 );
             }
         }
@@ -2834,7 +2859,9 @@ mod tests {
                 assert!(
                     val.is_finite(),
                     "s24: smooth[{}][{}] = {} not finite",
-                    i, j, val
+                    i,
+                    j,
+                    val
                 );
             }
         }

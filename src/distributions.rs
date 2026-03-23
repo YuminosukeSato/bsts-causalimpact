@@ -271,7 +271,10 @@ mod tests {
         }
         let mean0 = sum[0] / n as f64;
         let mean1 = sum[1] / n as f64;
-        assert!((mean0 - 5.0).abs() < 0.2, "Mean[0] {mean0} should be near 5");
+        assert!(
+            (mean0 - 5.0).abs() < 0.2,
+            "Mean[0] {mean0} should be near 5"
+        );
         assert!(
             (mean1 - (-3.0)).abs() < 0.2,
             "Mean[1] {mean1} should be near -3"

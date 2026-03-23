@@ -4,6 +4,9 @@ set -euo pipefail
 echo "=== pre-push: cargo test ==="
 cargo test
 
+echo "=== pre-push: cargo clippy --lib -- -W clippy::perf ==="
+cargo clippy --lib -- -W clippy::perf
+
 echo "=== pre-push: pytest ==="
 if [ -f .venv/bin/pytest ]; then
   .venv/bin/pytest tests/ --tb=short -q

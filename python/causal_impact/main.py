@@ -91,15 +91,15 @@ class CausalImpact:
         self._results = self._compute_results(self._prepared, self._samples)
 
     def _run_sampler(self, prepared: PreparedData, args: dict):
-        y_full = np.concatenate([prepared.y_pre, prepared.y_post])
+        y_full = np.ascontiguousarray(np.concatenate([prepared.y_pre, prepared.y_post]))
 
         x_cols = None
         if prepared.X_pre is not None and prepared.X_post is not None:
-            X_full = np.vstack([prepared.X_pre, prepared.X_post])
-            x_cols = [X_full[:, j].tolist() for j in range(X_full.shape[1])]
+            X_full = np.ascontiguousarray(np.vstack([prepared.X_pre, prepared.X_post]))
+            x_cols = np.ascontiguousarray(X_full.T)
 
         return run_gibbs_sampler(
-            y=y_full.tolist(),
+            y=y_full,
             x=x_cols,
             pre_end=len(prepared.y_pre),
             niter=args["niter"],

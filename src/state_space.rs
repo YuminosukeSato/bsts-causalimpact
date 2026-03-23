@@ -83,14 +83,14 @@ pub struct StateSpaceModel {
 }
 
 impl StateSpaceModel {
-    pub fn new(y: Vec<f64>, x: Vec<Vec<f64>>, seasonal: Option<SeasonalConfig>) -> Self {
+    pub fn new(t_total: usize, x: Vec<Vec<f64>>, seasonal: Option<SeasonalConfig>) -> Self {
         let has_state_seasonal = seasonal.map(|c| c.nseasons() > 1).unwrap_or(false);
         // When using state-space seasonal, do NOT build dummy regressors
         let seasonal_x = if has_state_seasonal {
             vec![]
         } else {
             seasonal
-                .map(|config| build_seasonal_design(y.len(), config))
+                .map(|config| build_seasonal_design(t_total, config))
                 .unwrap_or_default()
         };
         Self {
@@ -102,7 +102,9 @@ impl StateSpaceModel {
 
     #[inline]
     pub fn has_seasonal(&self) -> bool {
-        self.seasonal_config.map(|c| c.nseasons() > 1).unwrap_or(false)
+        self.seasonal_config
+            .map(|c| c.nseasons() > 1)
+            .unwrap_or(false)
     }
 
     #[inline]
@@ -112,7 +114,9 @@ impl StateSpaceModel {
 
     #[inline]
     pub fn seasonal_duration(&self) -> usize {
-        self.seasonal_config.map(|c| c.season_duration()).unwrap_or(1)
+        self.seasonal_config
+            .map(|c| c.season_duration())
+            .unwrap_or(1)
     }
 
     #[inline]

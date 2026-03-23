@@ -39,3 +39,23 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
+
+[tool.semantic_release]
+tag_format = "v{version}"
+version_toml = [
+    "pyproject.toml:project.version",
+    "Cargo.toml:package.version",
+]
+version_variables = [
+    "src/lib.rs:MODULE_VERSION",
+]
+commit_message = "chore(release): {version}"
+no_git_verify = true
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.publish]
+dist_glob_patterns = ["dist/*"]
+upload_to_vcs_release = true
