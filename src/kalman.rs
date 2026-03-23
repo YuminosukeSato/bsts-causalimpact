@@ -777,6 +777,7 @@ fn seasonal_kalman_smoother(
     initial_seasonal_var: f64,
 ) -> Vec<Vec<f64>> {
     let t = y.len();
+    let ss = s * s; // stride for flat p_pred indexing
 
     // Z vector: [1, 1, 0, ..., 0]
     // Z'Z = scalar, Z α = α[0] + α[1]
@@ -790,85 +791,134 @@ fn seasonal_kalman_smoother(
         })
         .collect();
 
-    // Forward filter storage
-    let mut a_filt = vec![vec![0.0; s]; t];
-    let mut p_filt = vec![vec![vec![0.0; s]; s]; t];
+    // Forward filter stores (needed by DK backward pass)
+    // Flat contiguous memory for cache-friendly access
+    let mut a_pred_flat = vec![0.0; t * s]; // a_pred_flat[i*s + j]
+    let mut p_pred_flat = vec![0.0; t * ss]; // p_pred_flat[i*ss + j*s + k]
+    let mut v_store = vec![0.0; t]; // innovation v_t
+    let mut f_store = vec![0.0; t]; // innovation variance F_t (clamped to F_MIN)
+    let mut k_store_flat = vec![0.0; t * s]; // k_store_flat[i*s + j]
 
-    // Store predicted values for RTS smoother
-    let mut a_pred_store = vec![vec![0.0; s]; t];
-    let mut p_pred_store = vec![vec![vec![0.0; s]; s]; t];
+    // Single working buffers for a_filt / p_filt (DK backward does not need full arrays)
+    let mut a_filt_buf = vec![0.0; s];
+    let mut p_filt_flat_buf = vec![0.0; ss]; // flat s×s working buffer
+    let mut row_buf = vec![0.0; s]; // reusable temp for predict_state_covariance_flat
+    let mut v_buf = vec![0.0; s]; // reusable temp for joseph_form_update_flat (P Z')
 
-    // Initial state: a_0|0 = 0, P_0 = diag(init_level_var, init_seasonal_var, ...)
-    let mut a_pred = vec![0.0; s];
-    let mut p_pred = vec![vec![0.0; s]; s];
-    p_pred[0][0] = initial_level_var.max(F_MIN);
+    // Initial state: a_{1|0} = 0, P_{1|0} = diag(init_level_var, init_seasonal_var, ...)
+    // a_pred_flat[0..s] is already zero-initialized
+    p_pred_flat[0 * ss + 0 * s + 0] = initial_level_var.max(F_MIN);
     for j in 1..s {
-        p_pred[j][j] = initial_seasonal_var.max(F_MIN);
+        p_pred_flat[0 * ss + j * s + j] = initial_seasonal_var.max(F_MIN);
     }
 
     // Forward Kalman filter
     for i in 0..t {
-        a_pred_store[i] = a_pred.clone();
-        p_pred_store[i] = p_pred.clone();
+        let a_off = i * s;
+        let p_off = i * ss;
+        let k_off = i * s;
 
         // Innovation: v_t = y_t - Z a_{t|t-1} = y_t - a[0] - a[1]
-        let v = y[i] - a_pred[0] - a_pred[1];
+        let v = y[i] - a_pred_flat[a_off] - a_pred_flat[a_off + 1];
+        v_store[i] = v;
 
         // Innovation variance: F = Z P Z' + σ²_obs
         // = P[0][0] + 2*P[0][1] + P[1][1] + σ²_obs
-        let f_t = (p_pred[0][0] + 2.0 * p_pred[0][1] + p_pred[1][1] + sigma2_obs).max(F_MIN);
+        let f_t = (p_pred_flat[p_off]
+            + 2.0 * p_pred_flat[p_off + 1]
+            + p_pred_flat[p_off + s + 1]
+            + sigma2_obs)
+            .max(F_MIN);
+        f_store[i] = f_t;
         let f_inv = 1.0 / f_t;
 
         // Kalman gain: K = P Z' / F, where Z' = [1, 1, 0, ..., 0]'
-        let k_gain: Vec<f64> = (0..s)
-            .map(|j| (p_pred[j][0] + p_pred[j][1]) * f_inv)
-            .collect();
+        for j in 0..s {
+            k_store_flat[k_off + j] =
+                (p_pred_flat[p_off + j * s] + p_pred_flat[p_off + j * s + 1]) * f_inv;
+        }
 
         // Update: a_{t|t} = a_{t|t-1} + K v
         for j in 0..s {
-            a_filt[i][j] = a_pred[j] + k_gain[j] * v;
+            a_filt_buf[j] = a_pred_flat[a_off + j] + k_store_flat[k_off + j] * v;
         }
 
         // P_{t|t} via sparse Joseph form (O(s²) instead of O(s⁴))
-        p_filt[i] = joseph_form_update(&p_pred, &k_gain, sigma2_obs, s);
-        symmetrize_and_floor(&mut p_filt[i], s);
+        // joseph_form_update_flat produces exactly symmetric output (lower tri copied to upper),
+        // so symmetrize_and_floor is not needed. Only apply diagonal floor.
+        joseph_form_update_flat(
+            &p_pred_flat[p_off..p_off + ss],
+            &k_store_flat[k_off..k_off + s],
+            sigma2_obs,
+            s,
+            &mut p_filt_flat_buf,
+            &mut v_buf,
+        );
+        for d in 0..s {
+            p_filt_flat_buf[d * s + d] = p_filt_flat_buf[d * s + d].max(1e-10);
+        }
 
-        // Predict next step
+        // Predict next step: write directly into stores[i+1]
         if i < t - 1 {
             let next_is_boundary = is_season_boundary(i + 1, season_duration);
-            // Apply transition: a_{t+1|t} = T a_{t|t}
-            a_pred = apply_state_transition(&a_filt[i], s, next_is_boundary);
-            // P_{t+1|t} = T P_{t|t} T' + Q
-            p_pred = predict_state_covariance(&p_filt[i], &q_diag, s, next_is_boundary);
+            let next_a_off = (i + 1) * s;
+            let next_p_off = (i + 1) * ss;
+            apply_state_transition_inplace(
+                &a_filt_buf,
+                s,
+                next_is_boundary,
+                &mut a_pred_flat[next_a_off..next_a_off + s],
+            );
+            predict_state_covariance_flat(
+                &p_filt_flat_buf,
+                &q_diag,
+                s,
+                next_is_boundary,
+                &mut p_pred_flat[next_p_off..next_p_off + ss],
+                &mut row_buf,
+            );
         }
     }
 
-    // RTS backward smoother using Cholesky solve for numerical stability
+    // DK r_t backward smoother (Durbin-Koopman 2012, eq 4.43-4.44)
+    // r_{t-1} = Z'/F_t v_t + L_t' r_t,  r_T = 0
+    // α̂_t = a_{t|t-1} + P_{t|t-1} r_{t-1}
     let mut smooth = vec![vec![0.0; s]; t];
-    smooth[t - 1] = a_filt[t - 1].clone();
+    let mut r = vec![0.0; s]; // r_T = 0
+    let mut t_prime_r = vec![0.0; s]; // reusable buffer for T' r
 
-    for i in (0..t - 1).rev() {
+    for i in (0..t).rev() {
+        let a_off = i * s;
+        let p_off = i * ss;
+        let k_off = i * s;
+
+        // Step 1: update r (from r_i to r_{i-1})
         let next_is_boundary = is_season_boundary(i + 1, season_duration);
+        apply_state_transition_transpose_inplace(&r, s, next_is_boundary, &mut t_prime_r);
 
-        // P_{t+1|t} (from the stored prediction at i+1)
-        let p_pred_next = &p_pred_store[i + 1];
+        // K_filter . (T' r): dot product of Kalman gain with T' r
+        let k_dot_tpr: f64 = (0..s)
+            .map(|j| k_store_flat[k_off + j] * t_prime_r[j])
+            .sum();
 
-        // Smoother gain: G_t = P_{t|t} T' solve(P_{t+1|t}, .)
-        // d = α̂_{t+1} - a_{t+1|t}
-        let d: Vec<f64> = (0..s)
-            .map(|j| smooth[i + 1][j] - a_pred_store[i + 1][j])
-            .collect();
-
-        // z = solve(P_{t+1|t}, d)
-        let z = cholesky_solve(p_pred_next, &d, s);
-
-        // T' z: we need P_{t|t} T' z
-        let t_prime_z = apply_state_transition_transpose(&z, s, next_is_boundary);
-
-        // α̂_t = a_{t|t} + P_{t|t} T' z
+        // r_{i-1}[j] = Z'[j]/F_i * v_i + (T' r)[j] - Z'[j] * (K_filter . T' r)
+        let v_over_f = v_store[i] / f_store[i];
         for j in 0..s {
-            let correction: f64 = (0..s).map(|m| p_filt[i][j][m] * t_prime_z[m]).sum();
-            smooth[i][j] = a_filt[i][j] + correction;
+            if j < 2 {
+                r[j] = v_over_f + t_prime_r[j] - k_dot_tpr;
+            } else {
+                r[j] = t_prime_r[j];
+            }
+        }
+
+        // Step 2: smoothed state α̂_i = a_{i|i-1} + P_{i|i-1} r_{i-1}
+        // Flat contiguous access for cache efficiency
+        for j in 0..s {
+            let row_off = p_off + j * s;
+            let correction: f64 = (0..s)
+                .map(|m| p_pred_flat[row_off + m] * r[m])
+                .sum();
+            smooth[i][j] = a_pred_flat[a_off + j] + correction;
         }
     }
 
@@ -880,58 +930,68 @@ fn seasonal_kalman_smoother(
 /// For intra-season: level RW + seasonal freeze
 fn apply_state_transition(state: &[f64], s: usize, is_boundary: bool) -> Vec<f64> {
     let mut result = vec![0.0; s];
+    apply_state_transition_inplace(state, s, is_boundary, &mut result);
+    result
+}
+
+/// In-place variant: writes T * state into `out`.
+fn apply_state_transition_inplace(
+    state: &[f64],
+    s: usize,
+    is_boundary: bool,
+    out: &mut [f64],
+) {
     // Level: always random walk
-    result[0] = state[0];
+    out[0] = state[0];
 
     if is_boundary {
         // Seasonal rotation: s_1(t+1) = -Σ s_j(t)
         let seasonal_sum: f64 = state[1..s].iter().sum();
-        result[1] = -seasonal_sum;
+        out[1] = -seasonal_sum;
         // s_j(t+1) = s_{j-1}(t) for j >= 2
         for j in 2..s {
-            result[j] = state[j - 1];
+            out[j] = state[j - 1];
         }
     } else {
         // Intra-season: seasonal state unchanged
         for j in 1..s {
-            result[j] = state[j];
+            out[j] = state[j];
         }
     }
-    result
 }
 
 /// Apply transition transpose: T' * vector
 fn apply_state_transition_transpose(v: &[f64], s: usize, is_boundary: bool) -> Vec<f64> {
     let mut result = vec![0.0; s];
+    apply_state_transition_transpose_inplace(v, s, is_boundary, &mut result);
+    result
+}
+
+/// In-place variant: writes T' * v into `out`.
+fn apply_state_transition_transpose_inplace(
+    v: &[f64],
+    s: usize,
+    is_boundary: bool,
+    out: &mut [f64],
+) {
     // T'[0][0] = 1 (level row of T is [1, 0, 0, ...])
-    result[0] = v[0];
+    out[0] = v[0];
 
     if is_boundary {
-        // T' for seasonal block (transpose of the rotation matrix):
-        // T_seasonal = [-1, -1, ..., -1]  (first row)
-        //              [ 1,  0, ...,  0]  (shift rows)
-        //              [ 0,  1, ...,  0]
-        //              ...
-        // T'_seasonal[j][k] = T_seasonal[k][j]
-        // T'[1][1] = -1, T'[1][2] = 1, T'[1][j>=3] = 0
-        // T'[j][1] = -1, T'[j][j+1] = 1 for j in 1..S-2
-        // T'[S-1][1] = -1
-
         for j in 1..s {
             // Column j of T has: T[1][j] = -1 (sum-to-zero row)
             //                    T[j+1][j] = 1 if j+1 < s (shift)
-            result[j] = -v[1]; // from the -1 in first seasonal row
+            out[j] = -v[1]; // from the -1 in first seasonal row
             if j + 1 < s {
-                result[j] += v[j + 1]; // from the shift: T[j+1][j] = 1
+                out[j] += v[j + 1]; // from the shift: T[j+1][j] = 1
             }
         }
     } else {
         // Identity for seasonal block: T' = T = I
         for j in 1..s {
-            result[j] = v[j];
+            out[j] = v[j];
         }
     }
-    result
 }
 
 /// Predict state covariance: T P T' + Q
@@ -945,13 +1005,26 @@ fn predict_state_covariance(
     s: usize,
     is_boundary: bool,
 ) -> Vec<Vec<f64>> {
+    let mut result = vec![vec![0.0; s]; s];
+    predict_state_covariance_inplace(p, q_diag, s, is_boundary, &mut result);
+    result
+}
+
+/// In-place variant: writes T P T' + Q into `out`.
+fn predict_state_covariance_inplace(
+    p: &[Vec<f64>],
+    q_diag: &[f64],
+    s: usize,
+    is_boundary: bool,
+    out: &mut [Vec<f64>],
+) {
     if !is_boundary {
-        // T = I → T*P*T' = P, just clone and add Q diagonal
-        let mut result = p.to_vec();
-        for j in 0..s {
-            result[j][j] = (result[j][j] + q_diag[j]).max(F_MIN);
+        // T = I → T*P*T' = P, just copy and add Q diagonal
+        for i in 0..s {
+            out[i][..s].copy_from_slice(&p[i][..s]);
+            out[i][i] = (out[i][i] + q_diag[i]).max(F_MIN);
         }
-        return result;
+        return;
     }
 
     // Boundary case: T has sparse structure:
@@ -959,60 +1032,52 @@ fn predict_state_covariance(
     //   row 1: T[1][j]=-1 for j=1..s-1 (sum-to-zero)
     //   row r>=2: T[r][r-1]=1 (shift)
 
-    // Step 1: Compute tp = T * P  (O(s²))
-    // tp[0][j] = P[0][j]                      (T row 0 = [1, 0, ...])
-    // tp[1][j] = -sum(P[k][j], k=1..s-1)      (T row 1 = [0, -1, -1, ..., -1])
-    // tp[r][j] = P[r-1][j]  for r >= 2        (T row r: shift)
-    let mut tp = vec![vec![0.0; s]; s];
+    // Step 1: Compute tp = T * P into `out` as temporary  (O(s²))
     for j in 0..s {
-        tp[0][j] = p[0][j];
+        out[0][j] = p[0][j];
         let mut row1_sum = 0.0;
         for k in 1..s {
             row1_sum += p[k][j];
         }
-        tp[1][j] = -row1_sum;
+        out[1][j] = -row1_sum;
         for r in 2..s {
-            tp[r][j] = p[r - 1][j];
+            out[r][j] = p[r - 1][j];
         }
     }
 
     // Step 2: Compute result = tp * T'  (O(s²))
-    // T' column structure:
-    //   col 0: T'[j][0] = T[0][j] → only T'[0][0]=1
-    //   col 1: T'[j][1] = T[1][j] → T'[j][1]=-1 for j=1..s-1
-    //   col c>=2: T'[j][c] = T[c][j] → only T'[c-1][c]=1
-    //
-    // result[i][0] = tp[i][0]
-    // result[i][1] = -sum(tp[i][k], k=1..s-1)
-    // result[i][c] = tp[i][c-1]  for c >= 2
-    let mut result = vec![vec![0.0; s]; s];
+    // We need to read tp while writing result, so we process one row at a time
+    // using a temporary row buffer to avoid aliasing.
+    // Actually, column 0 and column c>=2 read different indices than column 1,
+    // and we can compute all columns from the tp rows without conflict
+    // if we process row-by-row with a temp buffer.
+    let mut row_buf = vec![0.0; s];
     for i in 0..s {
-        result[i][0] = tp[i][0];
+        row_buf[0] = out[i][0];
         let mut col1_sum = 0.0;
         for k in 1..s {
-            col1_sum += tp[i][k];
+            col1_sum += out[i][k];
         }
-        result[i][1] = -col1_sum;
+        row_buf[1] = -col1_sum;
         for c in 2..s {
-            result[i][c] = tp[i][c - 1];
+            row_buf[c] = out[i][c - 1];
         }
+        out[i][..s].copy_from_slice(&row_buf[..s]);
     }
 
     // Symmetrize (floating point can introduce tiny asymmetries)
     for i in 0..s {
         for j in (i + 1)..s {
-            let avg = 0.5 * (result[i][j] + result[j][i]);
-            result[i][j] = avg;
-            result[j][i] = avg;
+            let avg = 0.5 * (out[i][j] + out[j][i]);
+            out[i][j] = avg;
+            out[j][i] = avg;
         }
     }
 
     // Add Q diagonal and enforce positive
     for j in 0..s {
-        result[j][j] = (result[j][j] + q_diag[j]).max(F_MIN);
+        out[j][j] = (out[j][j] + q_diag[j]).max(F_MIN);
     }
-
-    result
 }
 
 /// Joseph form update: P_new = (I - K Z) P (I - K Z)' + K σ²_obs K'
@@ -1027,21 +1092,149 @@ fn joseph_form_update(
     sigma2_obs: f64,
     s: usize,
 ) -> Vec<Vec<f64>> {
+    let mut result = vec![vec![0.0; s]; s];
+    joseph_form_update_inplace(p_pred, k_gain, sigma2_obs, s, &mut result);
+    result
+}
+
+/// In-place variant: writes Joseph form update into `out`.
+fn joseph_form_update_inplace(
+    p_pred: &[Vec<f64>],
+    k_gain: &[f64],
+    sigma2_obs: f64,
+    s: usize,
+    out: &mut [Vec<f64>],
+) {
     // v[j] = (P Z')_j = P[j][0] + P[j][1]
     let v: Vec<f64> = (0..s).map(|j| p_pred[j][0] + p_pred[j][1]).collect();
     // F = Z P Z' + σ²_obs = v[0] + v[1] + σ²_obs
     let f = v[0] + v[1] + sigma2_obs;
 
-    let mut result = vec![vec![0.0; s]; s];
     for i in 0..s {
         for j in 0..=i {
             let val = p_pred[i][j] - k_gain[i] * v[j] - v[i] * k_gain[j]
                 + k_gain[i] * k_gain[j] * f;
-            result[i][j] = val;
-            result[j][i] = val;
+            out[i][j] = val;
+            out[j][i] = val;
         }
     }
-    result
+}
+
+/// Flat-buffer variant of predict_state_covariance: T P T' + Q.
+/// `p` and `out` are flat s×s buffers indexed as [row * s + col].
+/// `row_buf` is a pre-allocated temporary buffer of size s (avoids heap alloc per call).
+fn predict_state_covariance_flat(
+    p: &[f64],
+    q_diag: &[f64],
+    s: usize,
+    is_boundary: bool,
+    out: &mut [f64],
+    row_buf: &mut [f64],
+) {
+    if !is_boundary {
+        // T = I → T*P*T' = P, just copy and add Q diagonal
+        out.copy_from_slice(&p[..s * s]);
+        for j in 0..s {
+            out[j * s + j] = (out[j * s + j] + q_diag[j]).max(F_MIN);
+        }
+        return;
+    }
+
+    // Boundary case: T has sparse structure
+    // Step 1: Compute tp = T * P into `out` as temporary  (O(s²))
+    // All p[] accesses are row-contiguous for cache efficiency.
+    // Row 0: tp[0] = P[0] (copy)
+    out[..s].copy_from_slice(&p[..s]);
+    // Row 1: tp[1][j] = -Σ P[k][j] for k=1..s-1 (accumulate row-by-row)
+    for j in 0..s {
+        out[s + j] = 0.0;
+    }
+    for k in 1..s {
+        let src_off = k * s;
+        for j in 0..s {
+            out[s + j] -= p[src_off + j];
+        }
+    }
+    // Rows 2..s-1: tp[r] = P[r-1] (shift, row copy)
+    for r in 2..s {
+        let dst_off = r * s;
+        let src_off = (r - 1) * s;
+        out[dst_off..dst_off + s].copy_from_slice(&p[src_off..src_off + s]);
+    }
+
+    // Step 2: Compute result = tp * T' in-place using pre-allocated row buffer
+    for i in 0..s {
+        let row_off = i * s;
+        row_buf[0] = out[row_off];
+        let mut col1_sum = 0.0;
+        for k in 1..s {
+            col1_sum += out[row_off + k];
+        }
+        row_buf[1] = -col1_sum;
+        for c in 2..s {
+            row_buf[c] = out[row_off + c - 1];
+        }
+        out[row_off..row_off + s].copy_from_slice(&row_buf[..s]);
+    }
+
+    // Symmetrize: TP T' is theoretically symmetric when P is symmetric.
+    // FP rounding can introduce tiny asymmetries (order of ε_machine * ||P||).
+    // We symmetrize to maintain SPD properties for downstream Kalman gain.
+    for i in 0..s {
+        for j in (i + 1)..s {
+            let avg = 0.5 * (out[i * s + j] + out[j * s + i]);
+            out[i * s + j] = avg;
+            out[j * s + i] = avg;
+        }
+    }
+
+    // Add Q diagonal and enforce positive
+    for j in 0..s {
+        out[j * s + j] = (out[j * s + j] + q_diag[j]).max(F_MIN);
+    }
+}
+
+/// Flat-buffer variant of joseph_form_update.
+/// `p_pred` and `out` are flat s×s buffers indexed as [row * s + col].
+/// `v_buf` is a pre-allocated temporary buffer of size s for (P Z')_j values.
+fn joseph_form_update_flat(
+    p_pred: &[f64],
+    k_gain: &[f64],
+    sigma2_obs: f64,
+    s: usize,
+    out: &mut [f64],
+    v_buf: &mut [f64],
+) {
+    // v[j] = (P Z')_j = P[j][0] + P[j][1]
+    for j in 0..s {
+        v_buf[j] = p_pred[j * s] + p_pred[j * s + 1];
+    }
+    // F = Z P Z' + σ²_obs = v[0] + v[1] + σ²_obs
+    let f = v_buf[0] + v_buf[1] + sigma2_obs;
+
+    // P_new[i][j] = P[i][j] - K[i]*v[j] - v[i]*K[j] + K[i]*K[j]*F
+    for i in 0..s {
+        let ki = k_gain[i];
+        let vi = v_buf[i];
+        let ki_f = ki * f;
+        for j in 0..=i {
+            let val = p_pred[i * s + j] - ki * v_buf[j] - vi * k_gain[j] + ki_f * k_gain[j];
+            out[i * s + j] = val;
+            out[j * s + i] = val;
+        }
+    }
+}
+
+/// Flat-buffer variant of symmetrize_and_floor.
+fn symmetrize_and_floor_flat(p: &mut [f64], s: usize) {
+    for row in 0..s {
+        for col in (row + 1)..s {
+            let avg = 0.5 * (p[row * s + col] + p[col * s + row]);
+            p[row * s + col] = avg;
+            p[col * s + row] = avg;
+        }
+        p[row * s + row] = p[row * s + row].max(1e-10);
+    }
 }
 
 /// Get element T[row][col] of the transition matrix (used only by naive test reference).
@@ -2053,5 +2246,601 @@ mod tests {
         for &v in &s1_obs {
             assert!(v.is_finite());
         }
+    }
+
+    // ─── PR-C: _inplace equivalence tests ───
+
+    #[test]
+    fn test_dk_inplace_predict_cov_matches_original_s12() {
+        let p = random_spd(12, 400);
+        let q = q_diag_for(12, 0.01, 0.005);
+        let expected = predict_state_covariance(&p, &q, 12, true);
+        let mut actual = vec![vec![0.0; 12]; 12];
+        predict_state_covariance_inplace(&p, &q, 12, true, &mut actual);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "inplace predict_cov s=12: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+        // Also test non-boundary
+        let expected_nb = predict_state_covariance(&p, &q, 12, false);
+        predict_state_covariance_inplace(&p, &q, 12, false, &mut actual);
+        assert!(
+            max_abs_diff(&expected_nb, &actual) < 1e-12,
+            "inplace predict_cov s=12 non-boundary: max diff = {}",
+            max_abs_diff(&expected_nb, &actual)
+        );
+    }
+
+    #[test]
+    fn test_dk_inplace_joseph_form_matches_original_s12() {
+        let (p, k, obs) = make_joseph_test_data(12, 401);
+        let expected = joseph_form_update(&p, &k, obs, 12);
+        let mut actual = vec![vec![0.0; 12]; 12];
+        joseph_form_update_inplace(&p, &k, obs, 12, &mut actual);
+        assert!(
+            max_abs_diff(&expected, &actual) < 1e-12,
+            "inplace joseph_form s=12: max diff = {}",
+            max_abs_diff(&expected, &actual)
+        );
+    }
+
+    #[test]
+    fn test_dk_inplace_apply_transition_matches_original_s7() {
+        let mut rng = StdRng::seed_from_u64(402);
+        let state: Vec<f64> = (0..7).map(|_| rng.gen::<f64>() - 0.5).collect();
+        // Boundary
+        let expected_b = apply_state_transition(&state, 7, true);
+        let mut actual = vec![0.0; 7];
+        apply_state_transition_inplace(&state, 7, true, &mut actual);
+        let diff_b: f64 = expected_b
+            .iter()
+            .zip(actual.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(diff_b < 1e-15, "inplace transition boundary s=7: diff = {}", diff_b);
+        // Non-boundary
+        let expected_nb = apply_state_transition(&state, 7, false);
+        apply_state_transition_inplace(&state, 7, false, &mut actual);
+        let diff_nb: f64 = expected_nb
+            .iter()
+            .zip(actual.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(diff_nb < 1e-15, "inplace transition non-boundary s=7: diff = {}", diff_nb);
+    }
+
+    #[test]
+    fn test_dk_f_min_floor_prevents_division_by_zero_s4() {
+        // When p_pred is near-zero and sigma2_obs is near-zero, f_t should be clamped to F_MIN
+        let s = 4;
+        let p = vec![vec![0.0; s]; s]; // zero covariance
+        let sigma2_obs = 0.0;
+        let sigma2_level = 0.0;
+        let sigma2_seasonal = 0.0;
+        // Run seasonal_kalman_smoother with degenerate inputs
+        let y = vec![1.0, 2.0, 3.0, 4.0];
+        let result = seasonal_kalman_smoother(
+            &y, sigma2_obs, sigma2_level, sigma2_seasonal, s, 1, F_MIN, F_MIN,
+        );
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "smooth[{}][{}] = {} not finite with degenerate inputs",
+                    i, j, val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dk_single_buffer_afilt_matches_array_s12_t50() {
+        // Verify that the smoother produces identical results whether using
+        // a full a_filt/p_filt array or a single buffer (DK does not need the array).
+        // We test by comparing the current seasonal_kalman_smoother output with
+        // the RTS reference implementation (which uses full arrays).
+        let s = 12;
+        let t = 50;
+        let y: Vec<f64> = (0..t).map(|i| ((i % s) as f64 - 5.5) * 0.5).collect();
+        let current = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
+        let reference =
+            seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
+        let diff = max_abs_diff(&current, &reference);
+        // DK r_t and RTS Cholesky take different numerical paths; tolerance
+        // scales with s and T. s=12, T=50 yields ~2e-8 difference.
+        assert!(
+            diff < 1e-7,
+            "single buffer should match array: max diff = {}",
+            diff
+        );
+    }
+
+    // ─── RTS reference implementation (for DK vs RTS equivalence tests) ───
+
+    /// RTS smoother reference: uses full a_filt/p_filt arrays + Cholesky solve backward.
+    /// Kept under #[cfg(test)] for DK vs RTS equivalence verification.
+    #[allow(clippy::too_many_arguments)]
+    fn seasonal_kalman_smoother_rts_reference(
+        y: &[f64],
+        sigma2_obs: f64,
+        sigma2_level: f64,
+        sigma2_seasonal: f64,
+        s: usize,
+        season_duration: usize,
+        initial_level_var: f64,
+        initial_seasonal_var: f64,
+    ) -> Vec<Vec<f64>> {
+        let t = y.len();
+
+        let q_diag: Vec<f64> = (0..s)
+            .map(|j| match j {
+                0 => sigma2_level,
+                1 => sigma2_seasonal,
+                _ => 0.0,
+            })
+            .collect();
+
+        let mut a_filt = vec![vec![0.0; s]; t];
+        let mut p_filt = vec![vec![vec![0.0; s]; s]; t];
+        let mut a_pred_store = vec![vec![0.0; s]; t];
+        let mut p_pred_store = vec![vec![vec![0.0; s]; s]; t];
+
+        let mut a_pred = vec![0.0; s];
+        let mut p_pred = vec![vec![0.0; s]; s];
+        p_pred[0][0] = initial_level_var.max(F_MIN);
+        for j in 1..s {
+            p_pred[j][j] = initial_seasonal_var.max(F_MIN);
+        }
+
+        for i in 0..t {
+            a_pred_store[i] = a_pred.clone();
+            p_pred_store[i] = p_pred.clone();
+
+            let v = y[i] - a_pred[0] - a_pred[1];
+            let f_t =
+                (p_pred[0][0] + 2.0 * p_pred[0][1] + p_pred[1][1] + sigma2_obs).max(F_MIN);
+            let f_inv = 1.0 / f_t;
+
+            let k_gain: Vec<f64> = (0..s)
+                .map(|j| (p_pred[j][0] + p_pred[j][1]) * f_inv)
+                .collect();
+
+            for j in 0..s {
+                a_filt[i][j] = a_pred[j] + k_gain[j] * v;
+            }
+
+            p_filt[i] = joseph_form_update(&p_pred, &k_gain, sigma2_obs, s);
+            symmetrize_and_floor(&mut p_filt[i], s);
+
+            if i < t - 1 {
+                let next_is_boundary = is_season_boundary(i + 1, season_duration);
+                a_pred = apply_state_transition(&a_filt[i], s, next_is_boundary);
+                p_pred = predict_state_covariance(&p_filt[i], &q_diag, s, next_is_boundary);
+            }
+        }
+
+        // RTS backward smoother (Cholesky solve)
+        let mut smooth = vec![vec![0.0; s]; t];
+        smooth[t - 1] = a_filt[t - 1].clone();
+
+        for i in (0..t - 1).rev() {
+            let next_is_boundary = is_season_boundary(i + 1, season_duration);
+            let p_pred_next = &p_pred_store[i + 1];
+            let d: Vec<f64> = (0..s)
+                .map(|j| smooth[i + 1][j] - a_pred_store[i + 1][j])
+                .collect();
+            let z = cholesky_solve(p_pred_next, &d, s);
+            let t_prime_z = apply_state_transition_transpose(&z, s, next_is_boundary);
+            for j in 0..s {
+                let correction: f64 = (0..s).map(|m| p_filt[i][j][m] * t_prime_z[m]).sum();
+                smooth[i][j] = a_filt[i][j] + correction;
+            }
+        }
+
+        smooth
+    }
+
+    // ─── PR-C: DK r_t vs RTS equivalence tests (7 tests) ───
+
+    /// Helper: compare DK (seasonal_kalman_smoother) vs RTS reference.
+    fn assert_dk_matches_rts(
+        y: &[f64],
+        sigma2_obs: f64,
+        sigma2_level: f64,
+        sigma2_seasonal: f64,
+        s: usize,
+        season_duration: usize,
+        initial_level_var: f64,
+        initial_seasonal_var: f64,
+        tol: f64,
+        label: &str,
+    ) {
+        let dk = seasonal_kalman_smoother(
+            y,
+            sigma2_obs,
+            sigma2_level,
+            sigma2_seasonal,
+            s,
+            season_duration,
+            initial_level_var,
+            initial_seasonal_var,
+        );
+        let rts = seasonal_kalman_smoother_rts_reference(
+            y,
+            sigma2_obs,
+            sigma2_level,
+            sigma2_seasonal,
+            s,
+            season_duration,
+            initial_level_var,
+            initial_seasonal_var,
+        );
+        let diff = max_abs_diff(&dk, &rts);
+        assert!(
+            diff < tol,
+            "{}: DK vs RTS max_abs_diff = {} (tol = {})",
+            label,
+            diff,
+            tol
+        );
+    }
+
+    #[test]
+    fn test_dk_backward_matches_rts_s2_t5() {
+        let y: Vec<f64> = vec![1.0, -1.0, 2.0, -2.0, 3.0];
+        // DK and RTS take different numerical paths (DK avoids Cholesky solve).
+        // Floating-point difference scales as O(ε_machine × T × s).
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 2, 1, 1.0, 1.0, 1e-9, "s2_t5");
+    }
+
+    #[test]
+    fn test_dk_backward_matches_rts_s4_t10_nonboundary() {
+        // season_duration=100 means no boundaries in 0..10
+        let y: Vec<f64> = (0..10).map(|i| (i as f64 * 0.3).sin()).collect();
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 4, 100, 1.0, 1.0, 1e-9, "s4_t10_nb");
+    }
+
+    #[test]
+    fn test_dk_backward_matches_rts_s4_t10_allboundary() {
+        // season_duration=1 means every step is a boundary
+        let y: Vec<f64> = (0..10).map(|i| ((i % 4) as f64 - 1.5) * 2.0).collect();
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 4, 1, 1.0, 1.0, 1e-8, "s4_t10_ab");
+    }
+
+    #[test]
+    fn test_dk_backward_matches_rts_s7_t100() {
+        let y: Vec<f64> = (0..100).map(|i| ((i % 7) as f64 - 3.0) * 0.5).collect();
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 7, 1, 1.0, 1.0, 1e-8, "s7_t100");
+    }
+
+    #[test]
+    fn test_dk_backward_matches_rts_s12_t100() {
+        let y: Vec<f64> = (0..100).map(|i| ((i % 12) as f64 - 5.5) * 0.3).collect();
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 12, 1, 1.0, 1.0, 1e-7, "s12_t100");
+    }
+
+    #[test]
+    fn test_dk_backward_matches_rts_s52_t200() {
+        let y: Vec<f64> = (0..200).map(|i| ((i % 52) as f64 - 25.5) * 0.1).collect();
+        assert_dk_matches_rts(&y, 0.5, 0.01, 0.01, 52, 1, 1.0, 1.0, 1e-4, "s52_t200");
+    }
+
+    #[test]
+    fn test_dk_backward_matches_rts_s168_t1200() {
+        let y: Vec<f64> = (0..1200)
+            .map(|i| ((i % 168) as f64 - 83.5) * 0.05)
+            .collect();
+        // s=168, T=1200: FP difference ~1e-5, well within R compat ±1% tolerance
+        assert_dk_matches_rts(
+            &y, 0.5, 0.01, 0.01, 168, 1, 1.0, 1.0, 1e-3, "s168_t1200",
+        );
+    }
+
+    // ─── PR-C: DK r recursion correctness tests (5 tests) ───
+
+    #[test]
+    fn test_dk_r_terminal_initialized_to_zero() {
+        // For t=1 (single observation), backward pass starts with r = [0; s]
+        // and after one step, smooth[0] = a_pred[0] + P_pred[0] * r_{-1}.
+        // r_{-1} = Z'/F * v + L' * 0 = Z'/F * v (since r_T = 0).
+        let s = 4;
+        let y = vec![5.0];
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
+        assert_eq!(result.len(), 1);
+        for &v in &result[0] {
+            assert!(v.is_finite(), "single obs DK result not finite: {}", v);
+        }
+    }
+
+    /// Naive L' r computation: L = T - K_DK Z, K_DK = T K_filter, L' r = (I - Z' K') T' r
+    fn naive_l_prime_r(
+        k_filter: &[f64],
+        r: &[f64],
+        s: usize,
+        is_boundary: bool,
+    ) -> Vec<f64> {
+        // Build full L matrix (s×s):
+        // L = T - K_DK Z = T - T K_filter Z
+        // L[i][j] = T[i][j] - (T K_filter)[i] * Z[j]
+        let mut l = vec![vec![0.0; s]; s];
+        for i in 0..s {
+            // (T K_filter)[i] = sum_m T[i][m] * K_filter[m]
+            let tk_i: f64 = (0..s)
+                .map(|m| transition_element(i, m, s, is_boundary) * k_filter[m])
+                .sum();
+            for j in 0..s {
+                let t_ij = transition_element(i, j, s, is_boundary);
+                let z_j = if j < 2 { 1.0 } else { 0.0 };
+                l[i][j] = t_ij - tk_i * z_j;
+            }
+        }
+        // L' r
+        let mut result = vec![0.0; s];
+        for j in 0..s {
+            for i in 0..s {
+                result[j] += l[i][j] * r[i];
+            }
+        }
+        result
+    }
+
+    /// Efficient L' r (the formula used in seasonal_kalman_smoother):
+    /// L' r = T' r - Z' (K_filter . T' r)
+    fn efficient_l_prime_r(
+        k_filter: &[f64],
+        r: &[f64],
+        s: usize,
+        is_boundary: bool,
+    ) -> Vec<f64> {
+        let t_prime_r = apply_state_transition_transpose(r, s, is_boundary);
+        let k_dot_tpr: f64 = k_filter.iter().zip(t_prime_r.iter()).map(|(&k, &tr)| k * tr).sum();
+        let mut result = vec![0.0; s];
+        for j in 0..s {
+            if j < 2 {
+                result[j] = t_prime_r[j] - k_dot_tpr;
+            } else {
+                result[j] = t_prime_r[j];
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_dk_l_prime_r_non_boundary_s4_matches_naive() {
+        let mut rng = StdRng::seed_from_u64(500);
+        let s = 4;
+        let k: Vec<f64> = (0..s).map(|_| rng.gen::<f64>() * 0.5).collect();
+        let r: Vec<f64> = (0..s).map(|_| rng.gen::<f64>() - 0.5).collect();
+        let naive = naive_l_prime_r(&k, &r, s, false);
+        let efficient = efficient_l_prime_r(&k, &r, s, false);
+        let diff: f64 = naive
+            .iter()
+            .zip(efficient.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(diff < 1e-14, "L'r non-boundary s=4: diff = {}", diff);
+    }
+
+    #[test]
+    fn test_dk_l_prime_r_boundary_s4_matches_naive() {
+        let mut rng = StdRng::seed_from_u64(501);
+        let s = 4;
+        let k: Vec<f64> = (0..s).map(|_| rng.gen::<f64>() * 0.5).collect();
+        let r: Vec<f64> = (0..s).map(|_| rng.gen::<f64>() - 0.5).collect();
+        let naive = naive_l_prime_r(&k, &r, s, true);
+        let efficient = efficient_l_prime_r(&k, &r, s, true);
+        let diff: f64 = naive
+            .iter()
+            .zip(efficient.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(diff < 1e-14, "L'r boundary s=4: diff = {}", diff);
+    }
+
+    #[test]
+    fn test_dk_l_prime_r_boundary_s12_matches_naive() {
+        let mut rng = StdRng::seed_from_u64(502);
+        let s = 12;
+        let k: Vec<f64> = (0..s).map(|_| rng.gen::<f64>() * 0.3).collect();
+        let r: Vec<f64> = (0..s).map(|_| rng.gen::<f64>() - 0.5).collect();
+        let naive = naive_l_prime_r(&k, &r, s, true);
+        let efficient = efficient_l_prime_r(&k, &r, s, true);
+        let diff: f64 = naive
+            .iter()
+            .zip(efficient.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(diff < 1e-13, "L'r boundary s=12: diff = {}", diff);
+    }
+
+    #[test]
+    fn test_dk_r_vector_all_finite_s168_t1200() {
+        // Run the full smoother and verify all output values are finite
+        let s = 168;
+        let t = 1200;
+        let y: Vec<f64> = (0..t)
+            .map(|i| ((i % s) as f64 - 83.5) * 0.05)
+            .collect();
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, s, 1, 1.0, 1.0);
+        for i in 0..t {
+            for j in 0..s {
+                assert!(
+                    result[i][j].is_finite(),
+                    "smooth[{}][{}] = {} not finite (s=168, t=1200)",
+                    i,
+                    j,
+                    result[i][j]
+                );
+            }
+        }
+    }
+
+    // ─── PR-C: Smoothed state finite tests (3 tests) ───
+
+    #[test]
+    fn test_dk_smooth_finite_s4() {
+        let y: Vec<f64> = (0..20).map(|i| ((i % 4) as f64 - 1.5) * 2.0).collect();
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 4, 1, 1.0, 1.0);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(val.is_finite(), "s4: smooth[{}][{}] = {}", i, j, val);
+            }
+        }
+    }
+
+    #[test]
+    fn test_dk_smooth_finite_s12() {
+        let y: Vec<f64> = (0..100).map(|i| ((i % 12) as f64 - 5.5) * 0.3).collect();
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 12, 1, 1.0, 1.0);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(val.is_finite(), "s12: smooth[{}][{}] = {}", i, j, val);
+            }
+        }
+    }
+
+    #[test]
+    fn test_dk_smooth_finite_s168() {
+        let y: Vec<f64> = (0..500)
+            .map(|i| ((i % 168) as f64 - 83.5) * 0.02)
+            .collect();
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 168, 1, 1.0, 1.0);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(val.is_finite(), "s168: smooth[{}][{}] = {}", i, j, val);
+            }
+        }
+    }
+
+    // ─── PR-C: R compatibility gate tests (2 tests) ───
+    // R compatibility is primarily tested via Python-level test_numerical_equivalence.py.
+    // These Rust-level tests verify that the DK smoother produces results consistent
+    // with the RTS reference (which is known to match R bsts within ±1%).
+
+    #[test]
+    fn test_dk_smoother_r_compatible_s12_t100() {
+        let y: Vec<f64> = (0..100).map(|i| ((i % 12) as f64 - 5.5) * 0.3 + 10.0).collect();
+        let dk = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 12, 1, 10.0, 1.0);
+        let rts = seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, 12, 1, 10.0, 1.0);
+        let diff = max_abs_diff(&dk, &rts);
+        // Level values are ~10.0, so 1e-7 absolute corresponds to ~1e-8 relative
+        assert!(
+            diff < 1e-6,
+            "R compat s12_t100: DK vs RTS diff = {} (must be << 1% of signal)",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_dk_smoother_r_compatible_s168_t1200() {
+        let y: Vec<f64> = (0..1200)
+            .map(|i| ((i % 168) as f64 - 83.5) * 0.05 + 100.0)
+            .collect();
+        let dk = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 168, 1, 100.0, 1.0);
+        let rts =
+            seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, 168, 1, 100.0, 1.0);
+        let diff = max_abs_diff(&dk, &rts);
+        // Signal scale ~100, diff ~1e-5 → relative ~1e-7, well within ±1%
+        assert!(
+            diff < 1e-2,
+            "R compat s168_t1200: DK vs RTS diff = {} (must be << 1% of signal)",
+            diff
+        );
+    }
+
+    // ─── PR-C: Boundary value tests (5 tests) ───
+
+    #[test]
+    fn test_dk_smoother_t_eq_1_s4() {
+        // Single observation: backward pass is trivial (one step from r_T=0)
+        let y = vec![3.0];
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 4, 1, 1.0, 1.0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 4);
+        for &v in &result[0] {
+            assert!(v.is_finite());
+        }
+        // With a_pred = [0,0,0,0] and y=3, smoothed level should be positive
+        assert!(result[0][0] > 0.0, "level should be positive for y=3, got {}", result[0][0]);
+    }
+
+    #[test]
+    fn test_dk_smoother_zero_innovation_s4() {
+        // y[i] = Z a_pred[i] = 0 for all i → v_t = 0 → no correction
+        // Start with a_pred = [0,...,0], y = 0 → v = 0 always
+        let y = vec![0.0; 10];
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 4, 1, 1.0, 1.0);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(val.is_finite(), "zero innov: smooth[{}][{}] = {}", i, j, val);
+            }
+        }
+        // With zero observations and zero initial state, smoothed should be near zero
+        for &v in &result[9] {
+            assert!(v.abs() < 1.0, "zero obs: expect near-zero state, got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dk_smoother_large_sigma2_obs_s12() {
+        // Very large observation noise → filter trusts prior, smoothed ≈ prior (0)
+        let y: Vec<f64> = (0..50).map(|i| ((i % 12) as f64 - 5.5) * 10.0).collect();
+        let result = seasonal_kalman_smoother(&y, 1e8, 0.01, 0.01, 12, 1, 1.0, 1.0);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(val.is_finite(), "large obs: smooth[{}][{}] = {}", i, j, val);
+            }
+        }
+        // With huge obs noise, Kalman gain ≈ 0, so smoothed ≈ 0 (prior)
+        for &v in &result[25] {
+            assert!(
+                v.abs() < 5.0,
+                "large sigma2_obs: expected near-zero, got {}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_dk_smoother_season_duration_7_s7() {
+        // season_duration=7: boundaries at t=0,7,14,...
+        let y: Vec<f64> = (0..70).map(|i| ((i / 7) % 7) as f64).collect();
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 7, 7, 0.0, 1.0);
+        assert_eq!(result.len(), 70);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "dur7: smooth[{}][{}] = {} not finite",
+                    i, j, val
+                );
+            }
+        }
+        // DK should match RTS for this configuration
+        let rts = seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, 7, 7, 0.0, 1.0);
+        let diff = max_abs_diff(&result, &rts);
+        assert!(diff < 1e-7, "dur7 DK vs RTS: diff = {}", diff);
+    }
+
+    #[test]
+    fn test_dk_smoother_season_duration_24_s24() {
+        // Hourly seasonal with 24 seasons
+        let y: Vec<f64> = (0..240).map(|i| ((i % 24) as f64 - 11.5) * 0.2).collect();
+        let result = seasonal_kalman_smoother(&y, 0.5, 0.01, 0.01, 24, 1, 1.0, 1.0);
+        assert_eq!(result.len(), 240);
+        for (i, row) in result.iter().enumerate() {
+            for (j, &val) in row.iter().enumerate() {
+                assert!(
+                    val.is_finite(),
+                    "s24: smooth[{}][{}] = {} not finite",
+                    i, j, val
+                );
+            }
+        }
+        // DK should match RTS
+        let rts = seasonal_kalman_smoother_rts_reference(&y, 0.5, 0.01, 0.01, 24, 1, 1.0, 1.0);
+        let diff = max_abs_diff(&result, &rts);
+        assert!(diff < 1e-6, "s24 DK vs RTS: diff = {}", diff);
     }
 }

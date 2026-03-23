@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "bsts-causalimpact"
-version = "1.2.0"
+version = "1.3.0"
 description = "CausalImpact for Python with Rust Gibbs sampler (R-compatible)"
 requires-python = ">=3.10"
 dependencies = [
