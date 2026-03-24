@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from causal_impact._core import run_gibbs_sampler
+from causal_impact._core import py_run_placebo_test, run_gibbs_sampler
 from causal_impact.analysis import CausalAnalysis, CausalImpactResults
+from causal_impact.conformal import ConformalResults, compute_conformal_intervals
 from causal_impact.data import DataProcessor, PreparedData
 from causal_impact.options import ModelOptions
+from causal_impact.placebo import PlaceboTestResults
 from causal_impact.plot import Plotter
 from causal_impact.summary import SummaryFormatter
 
@@ -87,6 +89,7 @@ class CausalImpact:
         self._pre_period = pre_period
         self._post_period = post_period
 
+        self._model_args = args
         self._samples = self._run_sampler(self._prepared, args)
         self._results = self._compute_results(self._prepared, self._samples)
 
@@ -197,3 +200,79 @@ class CausalImpact:
             "relative_effect_mean": self._results.relative_effect_mean,
             "p_value": self._results.p_value,
         }
+
+    def run_placebo_test(
+        self,
+        n_placebos: int | None = None,
+        min_pre_length: int = 3,
+    ) -> PlaceboTestResults:
+        """Run a placebo test to validate the causal effect.
+
+        Splits the pre-period at multiple points and compares
+        the real effect against the placebo distribution.
+
+        Args:
+            n_placebos: Max number of placebo splits. None = use all valid splits.
+            min_pre_length: Minimum pre-period length for each placebo split.
+
+        Returns:
+            PlaceboTestResults with p_value, effect_distribution, etc.
+        """
+        prepared = self._prepared
+        args = self._model_args
+
+        y_full = np.ascontiguousarray(np.concatenate([prepared.y_pre, prepared.y_post]))
+        x_cols = None
+        if prepared.X_pre is not None and prepared.X_post is not None:
+            X_full = np.ascontiguousarray(np.vstack([prepared.X_pre, prepared.X_post]))
+            x_cols = np.ascontiguousarray(X_full.T)
+
+        result = py_run_placebo_test(
+            y=y_full,
+            x=x_cols,
+            pre_end=len(prepared.y_pre),
+            niter=args["niter"],
+            nwarmup=args["nwarmup"],
+            seed=args["seed"],
+            prior_level_sd=args["prior_level_sd"],
+            expected_model_size=float(args["expected_model_size"]),
+            nseasons=args["nseasons"],
+            season_duration=args["season_duration"],
+            state_model=str(args["state_model"]),
+            n_placebos=n_placebos,
+            min_pre_length=min_pre_length,
+        )
+
+        return PlaceboTestResults(
+            p_value=result.p_value,
+            rank_ratio=result.rank_ratio,
+            effect_distribution=np.array(result.effect_distribution),
+            real_effect=result.real_effect,
+            n_placebos=result.n_placebos,
+        )
+
+    def run_conformal_analysis(
+        self,
+        alpha: float | None = None,
+    ) -> ConformalResults:
+        """Run split conformal inference to get distribution-free prediction intervals.
+
+        Splits the pre-period into train and calibration halves,
+        computes nonconformity scores on the calibration set, and derives
+        a conformal quantile q_hat.
+
+        Args:
+            alpha: Significance level. Defaults to self._alpha.
+
+        Returns:
+            ConformalResults with q_hat, lower, upper bounds.
+        """
+        if alpha is None:
+            alpha = self._alpha
+
+        return compute_conformal_intervals(
+            prepared=self._prepared,
+            model_args=self._model_args,
+            alpha=alpha,
+            post_predictions_destd=self._results.predictions_mean,
+        )
