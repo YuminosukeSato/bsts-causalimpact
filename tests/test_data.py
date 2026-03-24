@@ -7,7 +7,7 @@ from causal_impact.data import DataProcessor, PreparedData
 
 
 class TestValidateDataFrameInput:
-    """DataFrameの入力バリデーション."""
+    """DataFrame input validation."""
 
     def test_validate_dataframe_valid(self, sample_df, pre_period, post_period):
         result = DataProcessor.validate_and_prepare(sample_df, pre_period, post_period)
@@ -29,7 +29,7 @@ class TestValidateDataFrameInput:
 
 
 class TestPeriodValidation:
-    """期間指定のバリデーション."""
+    """Period specification validation."""
 
     def test_pre_period_overlap_post(self, sample_df):
         with pytest.raises(ValueError, match="overlap|before"):
@@ -64,7 +64,7 @@ class TestPeriodValidation:
             )
 
     def test_post_period_one_point(self, sample_df):
-        # 1時点のpost期間はエラーにならない
+        # A single-point post period should not raise an error
         result = DataProcessor.validate_and_prepare(
             sample_df,
             ["2020-01-01", "2020-04-08"],
@@ -74,7 +74,7 @@ class TestPeriodValidation:
 
 
 class TestNaNHandling:
-    """NaN値の処理."""
+    """NaN value handling."""
 
     def test_nan_in_y_pre(self, sample_df, pre_period, post_period):
         df = sample_df.copy()
@@ -83,7 +83,7 @@ class TestNaNHandling:
             DataProcessor.validate_and_prepare(df, pre_period, post_period)
 
     def test_nan_in_y_post(self, sample_df, pre_period, post_period):
-        # R互換: post期間のNaNは許可
+        # R-compatible: NaN in post period is allowed
         df = sample_df.copy()
         df.iloc[80, 0] = np.nan
         result = DataProcessor.validate_and_prepare(df, pre_period, post_period)
@@ -97,14 +97,14 @@ class TestNaNHandling:
 
 
 class TestStandardization:
-    """標準化と逆標準化."""
+    """Standardization and unstandardization."""
 
     def test_standardize_and_restore(self, sample_df, pre_period, post_period):
         result = DataProcessor.validate_and_prepare(sample_df, pre_period, post_period)
-        # 標準化されたy_preの平均≈0, 標準偏差≈1
+        # Standardized y_pre should have mean ~ 0, std ~ 1
         assert abs(result.y_pre.mean()) < 0.3
         assert abs(result.y_pre.std() - 1.0) < 0.3
-        # 逆標準化で元値に戻る
+        # Unstandardization restores original values
         original_y = sample_df["y"].values[:70]
         restored = result.y_pre * result.y_sd + result.y_mean
         np.testing.assert_allclose(restored, original_y, rtol=1e-10)
@@ -120,7 +120,7 @@ class TestStandardization:
 
 
 class TestEdgeCases:
-    """境界値テスト."""
+    """Edge case tests."""
 
     def test_all_same_y(self, pre_period, post_period):
         n = 100
@@ -131,7 +131,7 @@ class TestEdgeCases:
 
 
 class TestAlphaValidation:
-    """alpha パラメータのバリデーション."""
+    """alpha parameter validation."""
 
     def test_alpha_0(self, sample_df, pre_period, post_period):
         with pytest.raises(ValueError, match="alpha"):
@@ -159,7 +159,7 @@ class TestAlphaValidation:
 
 
 class TestIndexParsing:
-    """インデックス解析."""
+    """Index parsing."""
 
     def test_date_index_string(self, sample_df, pre_period, post_period):
         result = DataProcessor.validate_and_prepare(sample_df, pre_period, post_period)

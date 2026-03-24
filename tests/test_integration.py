@@ -29,7 +29,7 @@ def _make_causal_data(n=100, pre_frac=0.7, true_effect=3.0, noise_sd=0.5, seed=4
 
 
 class TestEndToEnd:
-    """E2Eテスト."""
+    """End-to-end tests."""
 
     def test_basic_usage_end_to_end(self):
         df, pre_period, post_period, _ = _make_causal_data()
@@ -283,10 +283,10 @@ class TestSpikeSlabIntegration:
 
 
 class TestPerformance:
-    """非機能テスト."""
+    """Non-functional tests."""
 
     def test_large_dataset_performance(self):
-        """1000時点のデータが10秒以内に完了."""
+        """1000 time-point dataset completes within 10 seconds."""
         rng = np.random.default_rng(42)
         n = 1000
         dates = pd.date_range("2020-01-01", periods=n, freq="D")
@@ -308,7 +308,7 @@ class TestPerformance:
 
 
 class TestRustBoundaryDispatch:
-    """Rust境界の入力形式."""
+    """Rust boundary input format."""
 
     def test_causal_impact_passes_numpy_arrays_because_the_main_path_should_use_the_rust_fast_path_instead_of_rebuilding_python_lists(  # noqa: E501
         self,

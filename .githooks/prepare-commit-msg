@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Claude Code の attribution / Co-Authored-By trailer をコミット前に削除する safety net
-# 有効化: git config core.hooksPath .githooks
+# Safety net to strip Claude Code attribution / Co-Authored-By trailers before commit
+# Enable: git config core.hooksPath .githooks
 
 set -euo pipefail
 
@@ -28,7 +28,7 @@ def is_claude_line(line: str) -> bool:
     return False
 
 
-# 末尾から Claude attribution 行を削除
+# Strip Claude attribution lines from the end
 while lines and (is_claude_line(lines[-1]) or lines[-1].strip() == ""):
     if is_claude_line(lines[-1]):
         lines.pop()

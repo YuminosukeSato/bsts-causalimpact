@@ -6,7 +6,7 @@ from causal_impact._core import GibbsSamples, run_gibbs_sampler
 
 
 class TestSamplerShapes:
-    """出力サイズの検証."""
+    """Output shape validation."""
 
     def test_sampler_returns_correct_shapes(self):
         y = [10.0 + 0.1 * i for i in range(100)]
@@ -82,7 +82,7 @@ class TestSamplerShapes:
 
 
 class TestSamplerReproducibility:
-    """シード固定での再現性."""
+    """Reproducibility with fixed seed."""
 
     def test_sampler_seed_reproducibility(self):
         y = [10.0 + 0.1 * i for i in range(50)]
@@ -143,7 +143,7 @@ class TestSamplerReproducibility:
 
 
 class TestSamplerCovariates:
-    """共変量の有無."""
+    """With and without covariates."""
 
     def test_sampler_no_covariates(self):
         y = [5.0] * 30
@@ -204,7 +204,7 @@ class TestSamplerCovariates:
 
 
 class TestSamplerBoundary:
-    """境界値テスト."""
+    """Boundary value tests."""
 
     def test_sampler_niter_1(self):
         y = [1.0, 2.0, 3.0, 4.0, 5.0]
@@ -265,7 +265,7 @@ class TestSamplerBoundary:
 
 
 class TestSamplerErrors:
-    """異常系テスト."""
+    """Error case tests."""
 
     def test_sampler_pre_end_equals_T(self):
         y = [1.0, 2.0, 3.0]
@@ -342,13 +342,13 @@ class TestSamplerErrors:
 
 
 class TestSamplerConvergence:
-    """既知信号での推定精度検証."""
+    """Estimation accuracy on known signals."""
 
     def test_sampler_convergence_known_signal(self):
-        """定数信号(y=10)をフィットし、post-period予測が近い値を返す.
+        """Fit a constant signal (y=10) and verify post-period predictions are close.
 
-        Rust sampler は standardize 済みデータを前提とする
-        (CausalImpact Python API が内部で standardize するため)。
+        The Rust sampler assumes standardized data
+        (CausalImpact Python API standardizes internally).
         """
         import numpy as np
 
@@ -357,7 +357,7 @@ class TestSamplerConvergence:
         true_level = 10.0
         y_raw = true_level + rng.normal(0, 0.5, n)
 
-        # CausalImpact と同じ standardize: (y - mean) / sd
+        # Same standardization as CausalImpact: (y - mean) / sd
         y_pre_mean = y_raw[:70].mean()
         y_pre_sd = y_raw[:70].std(ddof=1)
         y_std = ((y_raw - y_pre_mean) / y_pre_sd).tolist()
@@ -373,7 +373,7 @@ class TestSamplerConvergence:
             prior_level_sd=0.01,
         )
 
-        # unstandardize して元のスケールで比較
+        # Unstandardize and compare on the original scale
         preds = np.array(result.predictions) * y_pre_sd + y_pre_mean
         mean_pred = preds.mean()
         assert abs(mean_pred - true_level) < 2.0, (

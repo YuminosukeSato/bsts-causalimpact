@@ -1,24 +1,24 @@
-"""R CausalImpact (bsts) との数値同値性テスト.
+"""Numerical equivalence tests against R CausalImpact (bsts).
 
-証明の根拠:
-  Local Level Model + 同一事前分布 + 同一共役更新規則
-  → niter 十分大で同一の真後験分布に収束（MCMC エルゴード定理）
-  → 指標別許容幅で数値同値性を確認
+Proof basis:
+  Local Level Model + identical prior + identical conjugate update rules
+  -> converges to the same true posterior with sufficient niter (MCMC ergodic theorem)
+  -> numerical equivalence verified per metric with tolerance bands
 
-許容誤差:
-  point_effect_mean     ±3%  相対誤差
-  cumulative_effect     ±3%  相対誤差
+Tolerances:
+  point_effect_mean     +-3%  relative error
+  cumulative_effect     +-3%  relative error
   ci_lower / ci_upper
-    - no-covariates     ±1.5%  相対誤差
-      niter=50000での収束値 ~0.83%、MCMC分散 ±0.5% を考慮した閾値。
-      prior修正 (SdPrior sample.size=32) + post-period Random Walk 伝播による。
-    - covariates        ±1% 相対誤差
-      static regression prior を R SpikeSlabPrior に合わせた閾値。
-    - Google R source の summary CI 定義とは整合済み
-  p_value               有意性分類一致 (α=0.05)
+    - no-covariates     +-1.5%  relative error
+      Converged value ~0.83% at niter=50000, threshold accounts for +-0.5% MCMC variance.
+      Due to prior correction (SdPrior sample.size=32) + post-period Random Walk propagation.
+    - covariates        +-1% relative error
+      Threshold aligned with R SpikeSlabPrior for the static regression prior.
+    - Consistent with summary CI definition in Google R source
+  p_value               significance classification match (alpha=0.05)
 
-no_effect シナリオ（true_effect=0）:
-  効果 ≈ 0 のため相対誤差が発散。絶対誤差 < 2.0 で比較。
+no_effect scenario (true_effect=0):
+  Effect ~ 0 causes relative error to diverge. Compared by absolute error < 2.0.
 """
 
 import json
@@ -34,7 +34,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 # R: niter=5000, SuggestBurn(0.1) ≈ 500 → 4500 post-warmup
 # Python: niter=20000, nwarmup=2000 → 18000 post-warmup
-# niter=20000 は CI bounds の MCMC 分散を ±0.5% 以内に抑えるために必要
+# niter=20000 is needed to keep CI bounds MCMC variance within +-0.5%
 MCMC_ARGS = {
     "niter": 20000,
     "nwarmup": 2000,
@@ -101,7 +101,7 @@ def _run_causal_impact(fixture: dict) -> dict:
 
 
 def _assert_relative(py_val: float, r_val: float, tol: float, metric: str) -> None:
-    """相対誤差で比較。r_val ≈ 0 なら絶対誤差にフォールバック。"""
+    """Compare by relative error. Falls back to absolute error when r_val ~ 0."""
     abs_threshold = 0.5
     if abs(r_val) < abs_threshold:
         abs_diff = abs(py_val - r_val)
@@ -118,7 +118,7 @@ def _assert_relative(py_val: float, r_val: float, tol: float, metric: str) -> No
 
 
 def _assert_absolute(py_val: float, r_val: float, tol: float, metric: str) -> None:
-    """絶対誤差で比較。true_effect=0 シナリオ用。"""
+    """Compare by absolute error. For the true_effect=0 scenario."""
     abs_diff = abs(py_val - r_val)
     assert abs_diff < tol, (
         f"{metric}: abs diff {abs_diff:.6f} >= {tol} (py={py_val:.6f}, r={r_val:.6f})"
@@ -340,7 +340,7 @@ class TestEquivalenceSeasonal:
 
 
 class TestEquivalenceNoEffect:
-    """no_effect: true_effect=0 のため絶対誤差で比較."""
+    """no_effect: compared by absolute error since true_effect=0."""
 
     SCENARIO = "no_effect"
 
