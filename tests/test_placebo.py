@@ -3,7 +3,6 @@
 import numpy as np
 import pandas as pd
 import pytest
-
 from causal_impact import CausalImpact
 
 
@@ -71,7 +70,9 @@ class TestPlaceboTest:
 
     def test_reproducible(self):
         df, pre, post = _make_no_effect_data()
-        ci = CausalImpact(df, pre, post, model_args={"niter": 100, "nwarmup": 50, "seed": 42})
+        ci = CausalImpact(
+            df, pre, post, model_args={"niter": 100, "nwarmup": 50, "seed": 42}
+        )
         r1 = ci.run_placebo_test(n_placebos=3, min_pre_length=10)
         r2 = ci.run_placebo_test(n_placebos=3, min_pre_length=10)
         np.testing.assert_array_equal(r1.effect_distribution, r2.effect_distribution)

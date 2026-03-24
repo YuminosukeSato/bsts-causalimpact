@@ -12,7 +12,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-
 from causal_impact import CausalImpact
 from causal_impact._core import py_dtw_distance
 

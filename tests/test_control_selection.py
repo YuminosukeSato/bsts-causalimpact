@@ -3,10 +3,12 @@
 import numpy as np
 import pandas as pd
 import pytest
-
-from causal_impact._core import py_dtw_distance, py_lb_keogh_distance, py_lb_keogh_envelope
+from causal_impact._core import (
+    py_dtw_distance,
+    py_lb_keogh_distance,
+    py_lb_keogh_envelope,
+)
 from causal_impact.selection import select_controls
-
 
 # ── DTW distance tests ──────────────────────────────────────────────
 
@@ -98,10 +100,7 @@ class TestLbKeogh:
         lo, hi = py_lb_keogh_envelope(y, 5)
         lb = py_lb_keogh_distance(xi, lo, hi)
         # Re-compute manually (scalar reference)
-        ref = sum(
-            max(0, l - x) + max(0, x - h)
-            for x, l, h in zip(xi, lo, hi)
-        )
+        ref = sum(max(0, lo_i - x) + max(0, x - h) for x, lo_i, h in zip(xi, lo, hi))
         assert lb == pytest.approx(ref, abs=1e-10)
 
     def test_non_multiple_of_4(self):
@@ -112,8 +111,7 @@ class TestLbKeogh:
             lo, hi = py_lb_keogh_envelope(y, 2)
             lb = py_lb_keogh_distance([float(v) for v in xi], lo, hi)
             ref = sum(
-                max(0, l - x) + max(0, x - h)
-                for x, l, h in zip(xi, lo, hi)
+                max(0, lo_i - x) + max(0, x - h) for x, lo_i, h in zip(xi, lo, hi)
             )
             assert lb == pytest.approx(ref, abs=1e-8), f"Failed for n={n}"
 
@@ -180,15 +178,12 @@ class TestSelectControls:
             },
             index=dates,
         )
-        result = select_controls(
-            df, "y", ["2020-01-01", "2020-02-01"], top_k=1
-        )
+        result = select_controls(df, "y", ["2020-01-01", "2020-02-01"], top_k=1)
         assert "y" in result.columns
         assert result.shape[1] == 2
 
     def test_scale_invariant(self):
         """DTW on z-scored data should select by shape, not scale."""
-        rng = np.random.default_rng(42)
         t = 80
         y = np.sin(np.linspace(0, 4 * np.pi, t))
         # x1: same shape, 1000x scale
