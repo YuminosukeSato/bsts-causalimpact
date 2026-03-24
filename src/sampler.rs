@@ -1574,6 +1574,162 @@ fn is_season_boundary_post(t: usize, season_duration: usize) -> bool {
     t.is_multiple_of(season_duration)
 }
 
+// ── Placebo test ────────────────────────────────────────────────────
+
+pub struct PlaceboTestResult {
+    pub p_value: f64,
+    pub rank_ratio: f64,
+    pub effect_distribution: Vec<f64>,
+    pub real_effect: f64,
+    pub n_placebos: usize,
+}
+
+/// Run a placebo test by splitting the pre-period at multiple points.
+///
+/// For each split point `s` in `[min_pre_length, pre_end)`:
+///   1. Treat `y[0..s]` as "pre" and `y[s..pre_end]` as fake "post"
+///   2. Run a Gibbs sampler chain
+///   3. Compute the absolute average point effect on the fake post-period
+///
+/// The real effect is ranked against the placebo distribution to produce a p-value.
+///
+/// All splits are executed in parallel via Rayon.
+#[allow(clippy::too_many_arguments)]
+pub fn run_placebo_test(
+    y: &[f64],
+    x: Vec<Vec<f64>>,
+    pre_end: usize,
+    niter: usize,
+    nwarmup: usize,
+    seed: u64,
+    prior_level_sd: f64,
+    expected_model_size: f64,
+    nseasons: Option<f64>,
+    season_duration: Option<f64>,
+    state_model_name: &str,
+    n_placebos: Option<usize>,
+    min_pre_length: usize,
+) -> Result<PlaceboTestResult, String> {
+    if pre_end <= min_pre_length {
+        return Err(format!(
+            "pre_end ({pre_end}) must be > min_pre_length ({min_pre_length})"
+        ));
+    }
+    if pre_end > y.len() {
+        return Err(format!(
+            "pre_end ({pre_end}) exceeds y length ({})",
+            y.len()
+        ));
+    }
+
+    let state_model = StateModel::from_name(state_model_name)?;
+    let seasonal = SeasonalConfig::from_optional(nseasons, season_duration)?;
+
+    // Use y[0..pre_end] only (the original pre-period).
+    let y_pre = &y[..pre_end];
+
+    // Compute real effect: run sampler on full y with real pre_end
+    let real_model = StateSpaceModel::new(y.len(), x.clone(), seasonal);
+    let real_chain = run_single_chain(
+        y,
+        &real_model,
+        pre_end,
+        niter,
+        nwarmup,
+        seed,
+        prior_level_sd,
+        0, // chain_id
+        expected_model_size,
+        false, // static only for placebo
+        state_model,
+    );
+    let real_effect_abs = compute_abs_average_effect(
+        &y[pre_end..],
+        &real_chain.predictions,
+    );
+
+    // Build split points
+    let mut splits: Vec<usize> = (min_pre_length..pre_end).collect();
+    if let Some(n) = n_placebos {
+        if splits.len() > n {
+            // Take the last n splits (largest pre-periods → more stable)
+            splits = splits[splits.len() - n..].to_vec();
+        }
+    }
+
+    // Rayon parallel: each split runs an independent Gibbs sampler
+    let effects: Vec<f64> = splits
+        .par_iter()
+        .enumerate()
+        .map(|(idx, &split)| {
+            let chain_seed = seed.wrapping_add(idx as u64 + 1);
+            // Build model for the sub-series y[0..pre_end]
+            // x columns are truncated to pre_end length
+            let x_truncated: Vec<Vec<f64>> = x
+                .iter()
+                .map(|col| col[..pre_end].to_vec())
+                .collect();
+            let model = StateSpaceModel::new(pre_end, x_truncated, seasonal);
+            let chain = run_single_chain(
+                y_pre,
+                &model,
+                split,
+                niter,
+                nwarmup,
+                chain_seed,
+                prior_level_sd,
+                0,
+                expected_model_size,
+                false,
+                state_model,
+            );
+            compute_abs_average_effect(&y_pre[split..], &chain.predictions)
+        })
+        .collect();
+
+    let n = effects.len();
+    let rank = effects.iter().filter(|&&e| e >= real_effect_abs).count();
+
+    Ok(PlaceboTestResult {
+        p_value: if n > 0 {
+            rank as f64 / n as f64
+        } else {
+            1.0
+        },
+        rank_ratio: rank as f64 / (n + 1) as f64,
+        effect_distribution: effects,
+        real_effect: real_effect_abs,
+        n_placebos: n,
+    })
+}
+
+/// Compute the absolute average point effect from raw predictions.
+/// predictions[i] = prediction vector for sample i (over post-period).
+fn compute_abs_average_effect(y_post: &[f64], predictions: &[Vec<f64>]) -> f64 {
+    if predictions.is_empty() || y_post.is_empty() {
+        return 0.0;
+    }
+    let t_post = y_post.len();
+    let n_samples = predictions.len();
+    // Average prediction at each time point
+    let mut avg_pred = vec![0.0; t_post];
+    for pred in predictions {
+        for (j, &p) in pred.iter().take(t_post).enumerate() {
+            avg_pred[j] += p;
+        }
+    }
+    for v in avg_pred.iter_mut() {
+        *v /= n_samples as f64;
+    }
+    // Average point effect
+    let sum_effect: f64 = y_post
+        .iter()
+        .zip(&avg_pred)
+        .map(|(&y, &p)| y - p)
+        .sum();
+    (sum_effect / t_post as f64).abs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

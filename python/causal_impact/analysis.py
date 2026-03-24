@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -39,6 +39,8 @@ class CausalImpactResults:
     cumulative_prediction_sd: float
     cumulative_prediction_lower: float
     cumulative_prediction_upper: float
+    conformal_lower: np.ndarray | None = field(default=None)
+    conformal_upper: np.ndarray | None = field(default=None)
 
 
 class CausalAnalysis:
