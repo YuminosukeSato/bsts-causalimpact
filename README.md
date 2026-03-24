@@ -3,6 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/bsts-causalimpact)](https://pypi.org/project/bsts-causalimpact/)
 [![Python](https://img.shields.io/pypi/pyversions/bsts-causalimpact)](https://pypi.org/project/bsts-causalimpact/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![R Numerical Equivalence](https://github.com/YuminosukeSato/bsts-causalimpact/actions/workflows/numerical-equivalence.yml/badge.svg?branch=main&event=push)](https://github.com/YuminosukeSato/bsts-causalimpact/actions/workflows/numerical-equivalence.yml)
 
 Bayesian structural time series for causal inference in Python.
 A faithful port of Google's [CausalImpact](https://google.github.io/CausalImpact/) R package. No TensorFlow required.
@@ -119,18 +120,33 @@ This library reproduces the core Gibbs-sampler workflow from R's bsts package in
 
 ## Numerical Equivalence with R
 
-Verified against R CausalImpact 1.4.1 (bsts) across 5 scenarios
-(`basic`, `covariates`, `strong_effect`, `no_effect`, `seasonal`).
-Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
+[![R Numerical Equivalence](https://github.com/YuminosukeSato/bsts-causalimpact/actions/workflows/numerical-equivalence.yml/badge.svg?branch=main&event=push)](https://github.com/YuminosukeSato/bsts-causalimpact/actions/workflows/numerical-equivalence.yml)
 
-### Current status
+Verified against R CausalImpact 1.4.1 (bsts 0.9.10, R 4.5) across 5 scenarios.
+Enforced on every commit via CI.
 
-| Metric | Status | Notes |
-|---|---|---|
-| `point_effect_mean` | ±3% relative | Passing on core scenarios |
-| `cumulative_effect_total` | ±3% relative | Passing on core scenarios |
-| `ci_lower` / `ci_upper` | Tight parity | `±1%` no-covariates, `±1%` covariates, explicit Phase 2 acceptance `±3%`, seasonal `±1%` |
-| `p_value` | Significance match | Classification at alpha=0.05 |
+### Test Matrix
+
+| Scenario | point_effect | cum_effect | ci_lower | ci_upper | rel_effect | p_value |
+|---|---|---|---|---|---|---|
+| basic | ±3% | ±3% | ±1% | ±1% | ±3% | alpha=0.05 |
+| covariates | ±3% | ±3% | ±1% | ±1% | ±3% | alpha=0.05 |
+| strong_effect | ±3% | ±3% | ±1% | ±1% | ±3% | alpha=0.05 |
+| no_effect | abs<2.0 | abs<2.0 | abs<2.0 | abs<2.0 | abs<0.5 | alpha=0.05 |
+| seasonal | ±1% | ±1% | ±1% | ±1% | ±1% | alpha=0.05 |
+
+### CI Enforcement
+
+Two-layer CI enforcement:
+
+1. Fixture-based (`ci.yml`): Compares Python output against committed R reference data. Blocking on every PR/push.
+2. Live R comparison (`numerical-equivalence.yml`): Installs R, regenerates fixtures from scratch, and compares. Blocking when R is available. Weekly auto-regeneration.
+
+### How to Reproduce
+
+1. Install R 4.5+ and packages: `install.packages(c("CausalImpact", "jsonlite"))`
+2. Generate R reference: `Rscript scripts/generate_r_reference.R`
+3. Run equivalence tests: `.venv/bin/pytest tests/test_numerical_equivalence.py -v`
 
 ### What is matching R and what is not
 
@@ -150,9 +166,6 @@ Tests run on every commit with seed-fixed MCMC for deterministic reproduction.
 
 Matching = CI-enforced numerical equivalence with R bsts (±3% or tighter).
 Supported = Feature implemented, no R parity fixture yet.
-
-Covariate CI bounds are enforced twice: the legacy parity fixture remains tighter than
-Phase 2 requirements, and a separate Phase 2 acceptance test keeps the threshold at `±3%`.
 
 ## API
 
