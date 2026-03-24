@@ -6,12 +6,33 @@ build-backend = "maturin"
 name = "bsts-causalimpact"
 version = "1.5.0"
 description = "CausalImpact for Python with Rust Gibbs sampler (R-compatible)"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+keywords = ["causal-inference", "bayesian", "time-series", "causal-impact", "bsts"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+]
 dependencies = [
     "numpy>=2.0",
     "pandas>=2.0",
     "matplotlib>=3.8",
 ]
+
+[project.urls]
+Homepage = "https://github.com/YuminosukeSato/bsts-causalimpact"
+Documentation = "https://yuminosukesato.github.io/bsts-causalimpact/"
+Repository = "https://github.com/YuminosukeSato/bsts-causalimpact"
+Changelog = "https://github.com/YuminosukeSato/bsts-causalimpact/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
