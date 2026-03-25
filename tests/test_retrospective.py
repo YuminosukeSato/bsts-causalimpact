@@ -10,11 +10,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from causal_impact import CausalImpact
 from causal_impact.decomposition import DateDecomposition
-from causal_impact.retrospective import build_treatment_design, extract_treatment_effects
-
+from causal_impact.retrospective import (
+    build_treatment_design,
+    extract_treatment_effects,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -100,7 +101,11 @@ class TestExtractTreatmentEffects:
     def test_returns_date_decomposition(self):
         rng = np.random.default_rng(42)
         beta_samples = rng.normal(0, 1, (100, 5))
-        result = extract_treatment_effects(beta_samples, treatment_col_start=2, t_post=30)
+        result = extract_treatment_effects(
+            beta_samples,
+            treatment_col_start=2,
+            t_post=30,
+        )
         assert isinstance(result, DateDecomposition)
 
     def test_correct_coefficients_extracted(self):
@@ -110,14 +115,22 @@ class TestExtractTreatmentEffects:
         beta_samples[:, 2] = 3.0  # spot
         beta_samples[:, 3] = 5.0  # persistent
         beta_samples[:, 4] = 0.1  # trend
-        result = extract_treatment_effects(beta_samples, treatment_col_start=2, t_post=20)
+        result = extract_treatment_effects(
+            beta_samples,
+            treatment_col_start=2,
+            t_post=20,
+        )
         assert result.spot.coefficient == pytest.approx(3.0, abs=1e-10)
         assert result.persistent.coefficient == pytest.approx(5.0, abs=1e-10)
         assert result.trend.coefficient == pytest.approx(0.1, abs=1e-10)
 
     def test_trajectory_shapes(self):
         beta_samples = np.random.default_rng(42).normal(0, 1, (50, 3))
-        result = extract_treatment_effects(beta_samples, treatment_col_start=0, t_post=15)
+        result = extract_treatment_effects(
+            beta_samples,
+            treatment_col_start=0,
+            t_post=15,
+        )
         assert result.spot.mean.shape == (15,)
         assert result.persistent.mean.shape == (15,)
         assert result.trend.mean.shape == (15,)
@@ -137,13 +150,22 @@ class TestRetrospectiveCausalImpact:
         We check the estimate is within ±50% of the true value.
         """
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=5.0, noise_sd=0.5, seed=42, t_pre=200, t_post=50,
+            beta_persistent=5.0,
+            noise_sd=0.5,
+            seed=42,
+            t_pre=200,
+            t_post=50,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 2000, "nwarmup": 1000, "seed": 42,
-                "mode": "retrospective", "prior_level_sd": 0.001,
+                "niter": 2000,
+                "nwarmup": 1000,
+                "seed": 42,
+                "mode": "retrospective",
+                "prior_level_sd": 0.001,
             },
         )
         dec = ci._decomposition
@@ -155,14 +177,23 @@ class TestRetrospectiveCausalImpact:
     def test_known_trend_effect(self):
         """Known trend: trend coefficient should be positive and non-trivial."""
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=0.0, beta_trend=0.5, noise_sd=0.5,
-            seed=77, t_pre=200, t_post=50,
+            beta_persistent=0.0,
+            beta_trend=0.5,
+            noise_sd=0.5,
+            seed=77,
+            t_pre=200,
+            t_post=50,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 2000, "nwarmup": 1000, "seed": 77,
-                "mode": "retrospective", "prior_level_sd": 0.001,
+                "niter": 2000,
+                "nwarmup": 1000,
+                "seed": 77,
+                "mode": "retrospective",
+                "prior_level_sd": 0.001,
             },
         )
         dec = ci._decomposition
@@ -173,14 +204,24 @@ class TestRetrospectiveCausalImpact:
     def test_zero_effect_includes_zero(self):
         """No effect: persistent coefficient should be close to zero."""
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=0.0, beta_spot=0.0, beta_trend=0.0,
-            noise_sd=0.5, seed=99, t_pre=150, t_post=50,
+            beta_persistent=0.0,
+            beta_spot=0.0,
+            beta_trend=0.0,
+            noise_sd=0.5,
+            seed=99,
+            t_pre=150,
+            t_post=50,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 1000, "nwarmup": 500, "seed": 99,
-                "mode": "retrospective", "prior_level_sd": 0.001,
+                "niter": 1000,
+                "nwarmup": 500,
+                "seed": 99,
+                "mode": "retrospective",
+                "prior_level_sd": 0.001,
             },
         )
         dec = ci._decomposition
@@ -191,13 +232,19 @@ class TestRetrospectiveCausalImpact:
     def test_spike_slab_auto_disabled(self):
         """Spike-and-slab should be auto-disabled in retrospective mode."""
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=3.0, with_covariate=True,
+            beta_persistent=3.0,
+            with_covariate=True,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 200, "nwarmup": 100, "seed": 42,
-                "mode": "retrospective", "expected_model_size": 1,
+                "niter": 200,
+                "nwarmup": 100,
+                "seed": 42,
+                "mode": "retrospective",
+                "expected_model_size": 1,
             },
         )
         # Should have run without error; gamma should be empty or all-True
@@ -207,14 +254,23 @@ class TestRetrospectiveCausalImpact:
     def test_with_covariate(self):
         """Retrospective with an additional covariate should still work."""
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=5.0, with_covariate=True,
-            noise_sd=0.5, seed=42, t_pre=200, t_post=50,
+            beta_persistent=5.0,
+            with_covariate=True,
+            noise_sd=0.5,
+            seed=42,
+            t_pre=200,
+            t_post=50,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 2000, "nwarmup": 1000, "seed": 42,
-                "mode": "retrospective", "prior_level_sd": 0.001,
+                "niter": 2000,
+                "nwarmup": 1000,
+                "seed": 42,
+                "mode": "retrospective",
+                "prior_level_sd": 0.001,
             },
         )
         dec = ci._decomposition
@@ -238,20 +294,34 @@ class TestRetrospectiveCausalImpact:
         y = np.cumsum(rng.normal(0, 1, n)) + 100
         y[100:] += 5.0
         df = pd.DataFrame({"y": y})
-        ci = CausalImpact(df, [0, 99], [100, 129], model_args={"niter": 100, "nwarmup": 50})
+        ci = CausalImpact(
+            df,
+            [0, 99],
+            [100, 129],
+            model_args={"niter": 100, "nwarmup": 50},
+        )
         assert ci._decomposition is None
         assert hasattr(ci, "decompose")
 
     def test_decompose_returns_cached_in_retrospective(self):
         """decompose() should return the cached decomposition in retrospective mode."""
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=3.0, noise_sd=0.5, seed=42, t_pre=100, t_post=30,
+            beta_persistent=3.0,
+            noise_sd=0.5,
+            seed=42,
+            t_pre=100,
+            t_post=30,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 200, "nwarmup": 100, "seed": 42,
-                "mode": "retrospective", "prior_level_sd": 0.001,
+                "niter": 200,
+                "nwarmup": 100,
+                "seed": 42,
+                "mode": "retrospective",
+                "prior_level_sd": 0.001,
             },
         )
         # decompose() should work without crashing
@@ -262,13 +332,22 @@ class TestRetrospectiveCausalImpact:
     def test_decompose_recomputes_with_different_alpha(self):
         """decompose(alpha=0.1) should recompute with new credible intervals."""
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=3.0, noise_sd=0.5, seed=42, t_pre=100, t_post=30,
+            beta_persistent=3.0,
+            noise_sd=0.5,
+            seed=42,
+            t_pre=100,
+            t_post=30,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 200, "nwarmup": 100, "seed": 42,
-                "mode": "retrospective", "prior_level_sd": 0.001,
+                "niter": 200,
+                "nwarmup": 100,
+                "seed": 42,
+                "mode": "retrospective",
+                "prior_level_sd": 0.001,
             },
         )
         dec_05 = ci.decompose(alpha=0.05)
@@ -282,13 +361,22 @@ class TestRetrospectiveCausalImpact:
     def test_short_post_period_no_crash(self):
         """Retrospective with t_post=2 should not crash (trend=None)."""
         df, pre, post, _ = _make_retrospective_data(
-            beta_persistent=3.0, noise_sd=0.5, seed=42, t_pre=50, t_post=2,
+            beta_persistent=3.0,
+            noise_sd=0.5,
+            seed=42,
+            t_pre=50,
+            t_post=2,
         )
         ci = CausalImpact(
-            df, pre, post,
+            df,
+            pre,
+            post,
             model_args={
-                "niter": 100, "nwarmup": 50, "seed": 42,
-                "mode": "retrospective", "prior_level_sd": 0.001,
+                "niter": 100,
+                "nwarmup": 50,
+                "seed": 42,
+                "mode": "retrospective",
+                "prior_level_sd": 0.001,
             },
         )
         dec = ci._decomposition
@@ -304,10 +392,14 @@ class TestRetrospectiveCausalImpact:
         df = pd.DataFrame({"y": y})
         with pytest.raises(ValueError, match="dynamic_regression"):
             CausalImpact(
-                df, [0, 29], [30, 49],
+                df,
+                [0, 29],
+                [30, 49],
                 model_args={
-                    "niter": 100, "nwarmup": 50,
-                    "mode": "retrospective", "dynamic_regression": True,
+                    "niter": 100,
+                    "nwarmup": 50,
+                    "mode": "retrospective",
+                    "dynamic_regression": True,
                 },
             )
 
@@ -317,6 +409,8 @@ class TestRetrospectiveCausalImpact:
         df = pd.DataFrame({"y": y})
         with pytest.raises(ValueError, match="mode"):
             CausalImpact(
-                df, [0, 29], [30, 49],
+                df,
+                [0, 29],
+                [30, 49],
                 model_args={"niter": 100, "nwarmup": 50, "mode": "invalid"},
             )

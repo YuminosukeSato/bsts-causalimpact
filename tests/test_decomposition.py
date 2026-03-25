@@ -11,14 +11,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from causal_impact.decomposition import (
     DateDecomposition,
-    EffectComponent,
     build_design_matrix,
     decompose_effects,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,7 +105,10 @@ class TestDecomposeRecovery:
         effects = _make_effects(100, t_post, beta_spot, beta_persistent, beta_trend)
         result = decompose_effects(effects)
         assert result.spot.coefficient == pytest.approx(beta_spot, abs=1e-12)
-        assert result.persistent.coefficient == pytest.approx(beta_persistent, abs=1e-12)
+        assert result.persistent.coefficient == pytest.approx(
+            beta_persistent,
+            abs=1e-12,
+        )
         assert result.trend is not None
         assert result.trend.coefficient == pytest.approx(beta_trend, abs=1e-12)
 
