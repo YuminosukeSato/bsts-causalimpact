@@ -11,9 +11,14 @@ from causal_impact._core import py_run_placebo_test, run_gibbs_sampler
 from causal_impact.analysis import CausalAnalysis, CausalImpactResults
 from causal_impact.conformal import ConformalResults, compute_conformal_intervals
 from causal_impact.data import DataProcessor, PreparedData
+from causal_impact.decomposition import DateDecomposition, decompose_effects
 from causal_impact.options import ModelOptions
 from causal_impact.placebo import PlaceboTestResults
 from causal_impact.plot import Plotter
+from causal_impact.retrospective import (
+    build_treatment_design,
+    extract_treatment_effects,
+)
 from causal_impact.summary import SummaryFormatter
 
 if TYPE_CHECKING:
@@ -80,6 +85,16 @@ class CausalImpact:
     ) -> None:
         args = _normalize_model_args(model_args)
         standardize = args.pop("standardize_data")
+        mode = args.pop("mode", "forward")
+        if mode not in {"forward", "retrospective"}:
+            msg = f"mode must be 'forward' or 'retrospective', got '{mode}'"
+            raise ValueError(msg)
+        if mode == "retrospective" and args.get("dynamic_regression"):
+            msg = (
+                "dynamic_regression is not supported in retrospective mode. "
+                "Use mode='forward' for time-varying coefficients."
+            )
+            raise ValueError(msg)
 
         self._prepared = DataProcessor.validate_and_prepare(
             data, pre_period, post_period, alpha=alpha, standardize=standardize
@@ -88,10 +103,23 @@ class CausalImpact:
         self._data = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
         self._pre_period = pre_period
         self._post_period = post_period
+        self._mode = mode
 
         self._model_args = args
-        self._samples = self._run_sampler(self._prepared, args)
-        self._results = self._compute_results(self._prepared, self._samples)
+        self._decomposition: DateDecomposition | None = None
+
+        if mode == "retrospective":
+            self._samples, retro_predictions = self._run_retrospective(
+                self._prepared,
+                args,
+            )
+            self._results = self._compute_results_from_predictions(
+                self._prepared,
+                retro_predictions,
+            )
+        else:
+            self._samples = self._run_sampler(self._prepared, args)
+            self._results = self._compute_results(self._prepared, self._samples)
 
     def _run_sampler(self, prepared: PreparedData, args: dict):
         y_full = np.ascontiguousarray(np.concatenate([prepared.y_pre, prepared.y_post]))
@@ -115,6 +143,89 @@ class CausalImpact:
             season_duration=args["season_duration"],
             dynamic_regression=bool(args.get("dynamic_regression", False)),
             state_model=str(args["state_model"]),
+        )
+
+    def _run_retrospective(self, prepared: PreparedData, args: dict):
+        """Run sampler in retrospective mode: treatment indicators as covariates."""
+        y_full = np.ascontiguousarray(np.concatenate([prepared.y_pre, prepared.y_post]))
+        n_total = len(y_full)
+        intervention_idx = len(prepared.y_pre)
+        t_post = len(prepared.y_post)
+
+        # Build treatment design columns
+        # NOTE: treatment_X is NOT divided by y_sd. The sampler fits on
+        # standardized y, so beta_treat = true_effect / y_sd. The
+        # de-standardization step (beta * y_sd) recovers the original scale.
+        treatment_X = build_treatment_design(n_total, intervention_idx)
+
+        # Stack user covariates + treatment columns
+        if prepared.X_pre is not None and prepared.X_post is not None:
+            X_full = np.vstack([prepared.X_pre, prepared.X_post])
+            X_full = np.hstack([X_full, treatment_X])
+        else:
+            X_full = treatment_X
+
+        x_cols = np.ascontiguousarray(X_full.T)
+        k_total = X_full.shape[1]
+
+        # Force spike-and-slab off: set expected_model_size >= k_total
+        expected_model_size = float(max(args["expected_model_size"], k_total))
+
+        samples = run_gibbs_sampler(
+            y=y_full,
+            x=x_cols,
+            pre_end=n_total,  # Fit on entire series
+            niter=args["niter"],
+            nwarmup=args["nwarmup"],
+            nchains=args["nchains"],
+            seed=args["seed"],
+            prior_level_sd=args["prior_level_sd"],
+            expected_model_size=expected_model_size,
+            nseasons=args["nseasons"],
+            season_duration=args["season_duration"],
+            dynamic_regression=False,  # Not supported in retrospective
+            state_model=str(args["state_model"]),
+        )
+
+        # Extract treatment effects from beta posteriors
+        beta_samples = np.array(samples.beta)
+        treatment_col_start = k_total - 3
+        # De-standardize beta coefficients
+        if prepared.y_sd != 1.0:
+            beta_destd = beta_samples * prepared.y_sd
+        else:
+            beta_destd = beta_samples
+
+        self._decomposition = extract_treatment_effects(
+            beta_destd,
+            treatment_col_start,
+            t_post,
+            alpha=self._alpha,
+        )
+
+        # Construct counterfactual predictions from treatment decomposition
+        # counterfactual = actual - treatment_effect
+        y_post = prepared.y_post * prepared.y_sd + prepared.y_mean
+        treatment_effects = (
+            self._decomposition.spot.samples + self._decomposition.persistent.samples
+        )
+        if self._decomposition.trend is not None:
+            treatment_effects = treatment_effects + self._decomposition.trend.samples
+        predictions = y_post[np.newaxis, :] - treatment_effects
+
+        return samples, predictions
+
+    def _compute_results_from_predictions(
+        self,
+        prepared: PreparedData,
+        predictions: np.ndarray,
+    ) -> CausalImpactResults:
+        """Compute results from pre-built predictions (used by retrospective mode)."""
+        y_post = prepared.y_post * prepared.y_sd + prepared.y_mean
+        return CausalAnalysis.compute_effects(
+            y_post=y_post,
+            predictions=predictions,
+            alpha=self._alpha,
         )
 
     def _compute_results(self, prepared: PreparedData, samples) -> CausalImpactResults:
@@ -154,6 +265,7 @@ class CausalImpact:
             self._prepared.time_index,
             len(self._prepared.y_pre),
             metrics=metrics,
+            decomposition=self._decomposition,
         )
 
     @property
@@ -250,6 +362,47 @@ class CausalImpact:
             real_effect=result.real_effect,
             n_placebos=result.n_placebos,
         )
+
+    def decompose(self, alpha: float | None = None) -> DateDecomposition:
+        """Decompose pointwise effects into spot, persistent, and trend (DATE).
+
+        Based on Schaffe-Odeleye et al. (2026), arXiv:2602.00836.
+
+        In retrospective mode, the decomposition is computed during initialization
+        from beta posteriors. If alpha matches, the cached result is returned.
+        If alpha differs, the decomposition is recomputed from the stored betas.
+
+        Args:
+            alpha: Significance level. Defaults to self._alpha.
+
+        Returns:
+            DateDecomposition with per-component posterior summaries.
+        """
+        if alpha is None:
+            alpha = self._alpha
+
+        if self._mode == "retrospective":
+            if self._decomposition is not None and self._decomposition.alpha == alpha:
+                return self._decomposition
+            # Recompute from stored beta posteriors with new alpha
+            beta_samples = np.array(self._samples.beta)
+            if self._prepared.y_sd != 1.0:
+                beta_samples = beta_samples * self._prepared.y_sd
+            t_post = len(self._prepared.y_post)
+            k_total = beta_samples.shape[1]
+            treatment_col_start = k_total - 3
+            self._decomposition = extract_treatment_effects(
+                beta_samples, treatment_col_start, t_post, alpha=alpha,
+            )
+            return self._decomposition
+
+        predictions = np.array(self._samples.predictions)
+        if self._prepared.y_sd != 1.0 or self._prepared.y_mean != 0.0:
+            predictions = predictions * self._prepared.y_sd + self._prepared.y_mean
+        y_post = self._prepared.y_post * self._prepared.y_sd + self._prepared.y_mean
+        effects = y_post[np.newaxis, :] - predictions
+        self._decomposition = decompose_effects(effects, alpha=alpha)
+        return self._decomposition
 
     def run_conformal_analysis(
         self,

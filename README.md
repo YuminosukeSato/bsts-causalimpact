@@ -202,9 +202,27 @@ Evidence per implementation (all verified from source code, not documentation cl
 | Seasonal component (`nseasons`, `season_duration`) | Matching | State-space model matching R bsts `AddSeasonal()` (±1% CI parity) |
 | Dynamic regression | Supported | Time-varying coefficients via random-walk FFBS; `dynamic_regression=True` |
 | Local linear trend | Supported | Opt in with `state_model="local_linear_trend"` |
+| DATE decomposition | Extended | Decomposes effects into spot/persistent/trend (arXiv:2602.00836) |
+| Retrospective mode | Extended | Treatment indicators as covariates; effects from beta posteriors (arXiv:2602.00836) |
+| Placebo test | Extended | Null distribution from pre-period splits |
+| Conformal inference | Extended | Distribution-free prediction intervals |
+| DTW control selection | Extended | Automatic covariate selection via Dynamic Time Warping |
 
 Matching = CI-enforced numerical equivalence with R bsts (±1% or tighter).
 Supported = Feature implemented, no R parity fixture yet.
+Extended = Python-only feature with no R equivalent.
+
+### Beyond R: Python-Only Extensions
+
+Features that go beyond R's CausalImpact. These have no R equivalent.
+
+| Feature | Method | What it does | Reference |
+|---|---|---|---|
+| DATE decomposition | `ci.decompose()` | Decomposes causal effect into spot, persistent, and trend | Schaffe-Odeleye et al. (2026), arXiv:2602.00836 |
+| Retrospective mode | `mode="retrospective"` | Treatment indicators as covariates; effects extracted from beta posteriors | Schaffe-Odeleye et al. (2026), arXiv:2602.00836 |
+| Placebo test | `ci.run_placebo_test()` | Validates effect against null distribution from pre-period splits | |
+| Conformal inference | `ci.run_conformal_analysis()` | Distribution-free prediction intervals | Vovk et al. (2005) |
+| DTW control selection | `select_controls()` | Automatic covariate selection via Dynamic Time Warping | Sakoe & Chiba (1978) |
 
 ## API
 
@@ -233,6 +251,7 @@ Supported = Feature implemented, no R parity fixture yet.
 | `season_duration` | `None` | Optional duration of each seasonal block; defaults to `1` when `nseasons` is set |
 | `dynamic_regression` | `False` | Enable time-varying regression coefficients (random-walk beta) |
 | `state_model` | `"local_level"` | `"local_level"` or `"local_linear_trend"` |
+| `mode` | `"forward"` | `"forward"` (counterfactual prediction) or `"retrospective"` (treatment indicators as covariates) |
 
 #### Methods and Properties
 
@@ -244,6 +263,9 @@ Supported = Feature implemented, no R parity fixture yet.
 | `inferences` | `DataFrame` | Per-timestep actuals, predictions, prediction s.d., and effect intervals |
 | `summary_stats` | `dict` | Aggregate statistics (effect mean, CI, p-value, etc.) |
 | `posterior_inclusion_probs` | `ndarray \| None` | Posterior inclusion probability per covariate |
+| `decompose(alpha=None)` | `DateDecomposition` | DATE decomposition into spot/persistent/trend components |
+| `run_placebo_test(...)` | `PlaceboTestResults` | Placebo test for effect validation |
+| `run_conformal_analysis(...)` | `ConformalResults` | Distribution-free conformal prediction intervals |
 
 ## Benchmark Results
 
@@ -268,6 +290,8 @@ python/causal_impact/
     analysis.py          # CausalAnalysis: effect computation, CI, p-values
     summary.py           # SummaryFormatter: tabular and narrative reports
     plot.py              # Plotter: matplotlib visualization
+    decomposition.py     # DATE decomposition (spot/persistent/trend)
+    retrospective.py     # Retrospective attribution mode
 
 src/ (Rust)
     lib.rs               # PyO3 entry point: run_gibbs_sampler()

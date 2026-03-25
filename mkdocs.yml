@@ -17,6 +17,7 @@ nav:
   - Getting Started: index.md
   - Examples: examples.md
   - API Reference: api.md
+  - Theory (DATE): theory.md
   - Migration from R: migration-from-r.md
   - Migration from tfp: migration-from-tfp.md
   - Compatibility Matrix: compatibility-matrix.md
@@ -30,6 +31,12 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.snippets
   - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
   - admonition
   - pymdownx.details
   - tables
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js

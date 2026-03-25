@@ -100,8 +100,8 @@ fn validate_inputs(y: &[f64], pre_end: usize, nchains: usize) -> Result<(), Stri
     if pre_end == 0 {
         return Err("pre_end must be at least 1".to_string());
     }
-    if pre_end >= y.len() {
-        return Err("pre_end must be less than length of y (no post-period)".to_string());
+    if pre_end > y.len() {
+        return Err("pre_end must be <= length of y".to_string());
     }
     if nchains == 0 {
         return Err("nchains must be at least 1".to_string());
@@ -1808,11 +1808,38 @@ mod tests {
 
     #[test]
     fn test_run_sampler_pre_end_equals_t() {
+        // pre_end == y.len() is valid for retrospective mode (no post-period).
         let y: Vec<f64> = vec![1.0, 2.0, 3.0];
         let result = run_sampler(
             &y,
             vec![],
             3,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+            "local_level",
+        );
+        assert!(result.is_ok());
+        let gibbs = result.unwrap();
+        // Predictions should be empty (no post-period)
+        for pred in &gibbs.predictions {
+            assert!(pred.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_run_sampler_pre_end_exceeds_t() {
+        let y: Vec<f64> = vec![1.0, 2.0, 3.0];
+        let result = run_sampler(
+            &y,
+            vec![],
+            4,
             10,
             5,
             1,

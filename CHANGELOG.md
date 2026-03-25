@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Added
+
+- DATE decomposition (`ci.decompose()`): decomposes pointwise causal effects
+  into spot, persistent, and trend components via OLS projection on the
+  MCMC posterior. Pure Python, no Rust changes.
+  Reference: Schaffe-Odeleye et al. (2026), arXiv:2602.00836.
+- Decomposition plot panel: `ci.plot(metrics=[..., "decomposition"])` adds a
+  fourth panel showing the three components with credible intervals.
+- `DateDecomposition` and `EffectComponent` exported from `causal_impact`.
+- Retrospective attribution mode (`mode="retrospective"`): treatment indicator
+  columns (spot, persistent, trend) are added as covariates and the model is fit
+  on the entire time series. Effects are extracted from beta posteriors.
+  Reference: Schaffe-Odeleye et al. (2026), arXiv:2602.00836.
+- "Beyond R" documentation section covering all Python-only extensions
+  (DATE decomposition, retrospective mode, placebo test, conformal inference,
+  DTW control selection).
+- `docs/theory.md`: mathematical background for DATE decomposition.
+- MathJax support in mkdocs for LaTeX rendering.
+
 ## [1.3.1] - 2026-03-23
 
 ### Changed
