@@ -16,6 +16,53 @@ const STATIC_REGRESSION_PRIOR_INFORMATION_WEIGHT: f64 = 0.01;
 const STATIC_REGRESSION_DIAGONAL_SHRINKAGE: f64 = 0.5;
 const LOCAL_LINEAR_TREND_SLOPE_SD_RATIO: f64 = 0.1;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum PriorType {
+    SpikeSlab,
+    Horseshoe,
+}
+
+impl PriorType {
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "spike_slab" => Ok(PriorType::SpikeSlab),
+            "horseshoe" => Ok(PriorType::Horseshoe),
+            _ => Err(format!(
+                "prior_type must be 'spike_slab' or 'horseshoe', got '{s}'"
+            )),
+        }
+    }
+}
+
+struct HorseshoeState {
+    tau2: f64,
+    xi: f64,
+    lambda2: Vec<f64>,
+    nu: Vec<f64>,
+}
+
+impl HorseshoeState {
+    fn new(k: usize, tau0_sq: f64) -> Self {
+        HorseshoeState {
+            tau2: tau0_sq,
+            xi: 1.0,
+            lambda2: vec![1.0; k],
+            nu: vec![1.0; k],
+        }
+    }
+
+    fn kappa(&self) -> Vec<f64> {
+        self.lambda2
+            .iter()
+            .map(|&l2| {
+                // Use same floor as precision diagonal to keep diagnostic consistent
+                let prod = (l2 * self.tau2).max(1e-30);
+                1.0 / (1.0 + prod)
+            })
+            .collect()
+    }
+}
+
 struct StaticRegressionPrior {
     beta_mean: Vec<f64>,
     beta_precision: Vec<Vec<f64>>,
@@ -32,6 +79,7 @@ struct ChainResult {
     beta: Vec<Vec<f64>>,
     gamma: Vec<Vec<bool>>,
     predictions: Vec<Vec<f64>>,
+    kappa_shrinkage: Vec<Vec<f64>>,
 }
 
 pub struct GibbsResult {
@@ -42,6 +90,7 @@ pub struct GibbsResult {
     pub beta: Vec<Vec<f64>>,
     pub gamma: Vec<Vec<bool>>,
     pub predictions: Vec<Vec<f64>>,
+    pub kappa_shrinkage: Vec<Vec<f64>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -59,12 +108,31 @@ pub fn run_sampler(
     season_duration: Option<f64>,
     dynamic_regression: bool,
     state_model: &str,
+    prior_type: PriorType,
 ) -> Result<GibbsResult, String> {
     validate_inputs(y, pre_end, nchains)?;
 
     let k = x.len();
-    if k > 0 && expected_model_size <= 0.0 && !dynamic_regression {
+    if k > 0 {
+        let t = y.len();
+        for (i, col) in x.iter().enumerate() {
+            if col.len() != t {
+                return Err(format!(
+                    "covariate column {} has length {} but y has length {}",
+                    i,
+                    col.len(),
+                    t
+                ));
+            }
+        }
+    }
+    if k > 0 && expected_model_size <= 0.0 && !dynamic_regression && prior_type == PriorType::SpikeSlab {
         return Err("expected_model_size must be > 0 when covariates are present".to_string());
+    }
+    if dynamic_regression && prior_type == PriorType::Horseshoe {
+        return Err(
+            "horseshoe prior is not supported with dynamic_regression=True".to_string(),
+        );
     }
 
     let seasonal = SeasonalConfig::from_optional(nseasons, season_duration)?;
@@ -86,6 +154,7 @@ pub fn run_sampler(
                 expected_model_size,
                 dynamic_regression,
                 state_model,
+                prior_type,
             )
         })
         .collect();
@@ -129,6 +198,7 @@ fn run_single_chain(
     expected_model_size: f64,
     dynamic_regression: bool,
     state_model: StateModel,
+    prior_type: PriorType,
 ) -> ChainResult {
     if dynamic_regression {
         run_single_chain_dynamic(
@@ -154,6 +224,7 @@ fn run_single_chain(
             chain_id,
             expected_model_size,
             state_model,
+            prior_type,
         )
     }
 }
@@ -205,6 +276,7 @@ fn run_single_chain_dynamic(
         beta: Vec::with_capacity(niter),
         gamma: Vec::with_capacity(0), // spike-and-slab disabled
         predictions: Vec::with_capacity(niter),
+        kappa_shrinkage: Vec::with_capacity(0), // horseshoe disabled in dynamic
     };
     let mut adjusted = vec![0.0; pre_end];
     let mut beta_targets = vec![0.0; pre_end];
@@ -379,6 +451,7 @@ fn run_single_chain_static(
     chain_id: usize,
     expected_model_size: f64,
     state_model: StateModel,
+    prior_type: PriorType,
 ) -> ChainResult {
     let t_total = y.len();
     let k = model.num_covariates();
@@ -413,6 +486,8 @@ fn run_single_chain_static(
         0
     };
 
+    let use_horseshoe = k > 0 && prior_type == PriorType::Horseshoe;
+
     let mut chain_result = ChainResult {
         chain_id,
         states: Vec::with_capacity(niter),
@@ -420,23 +495,48 @@ fn run_single_chain_static(
         sigma_level: Vec::with_capacity(niter),
         sigma_seasonal: Vec::with_capacity(if use_state_seasonal { niter } else { 0 }),
         beta: Vec::with_capacity(niter),
-        gamma: Vec::with_capacity(niter),
+        gamma: Vec::with_capacity(if use_horseshoe { 0 } else { niter }),
         predictions: Vec::with_capacity(niter),
+        kappa_shrinkage: Vec::with_capacity(if use_horseshoe { niter } else { 0 }),
     };
 
-    // Compute pi and log_prior_odds once
-    let pi = if k > 0 {
+    // Compute pi and log_prior_odds once (spike-and-slab only)
+    let pi = if k > 0 && !use_horseshoe {
         (expected_model_size / k as f64).min(1.0)
     } else {
         1.0
     };
-    let use_spike_slab = k > 0 && pi < 1.0;
+    let use_spike_slab = k > 0 && pi < 1.0 && !use_horseshoe;
     let log_prior_odds = if use_spike_slab {
         (pi / (1.0 - pi)).ln()
     } else {
         0.0
     };
     let g = pre_end as f64; // Zellner's g-prior parameter
+
+    // Horseshoe state initialization
+    let xtx_cache = if use_horseshoe {
+        Some(cross_product_matrix(model.covariates(), pre_end))
+    } else {
+        None
+    };
+    // Heuristic init for global shrinkage (not specified in Kohns 2022 or
+    // Makalic 2015). tau0 = y_sd / (sqrt(k) * y_norm) anchors the prior
+    // scale to signal magnitude, normalized by covariate count. After
+    // standardization y_sd ≈ 1, so tau0 ≈ 1/(sqrt(k) * y_norm). The chain
+    // forgets this initial value within the warmup period. Falls back to 1.0
+    // when y is near-constant (y_norm ≈ 0). See docs/theory.md for details.
+    let mut hs = if use_horseshoe {
+        let y_norm = (y[..pre_end].iter().map(|v| v * v).sum::<f64>() / pre_end as f64).sqrt();
+        let tau0 = if y_norm > 1e-12 {
+            y_sd / ((k as f64).sqrt() * y_norm)
+        } else {
+            1.0
+        };
+        Some(HorseshoeState::new(k, tau0 * tau0))
+    } else {
+        None
+    };
 
     // Storage for seasonal state propagation
     let mut seasonal_state: Vec<f64> = vec![0.0; nseasons];
@@ -472,8 +572,45 @@ fn run_single_chain_static(
             s1_obs_pre = s1_obs;
 
             // Step 2: beta sampling (covariates only, no seasonal regressors)
+            // Horseshoe Gibbs order: state → beta (joint) → lambda2/nu → tau2/xi → sigma2_obs
+            // Spike-slab Gibbs order: state → sigma2_obs → beta (coordinate-wise)
+            // Horseshoe samples beta jointly via precision, so sigma2_obs must follow beta
+            // to condition on the updated residual. Spike-slab samples sigma2_obs first to
+            // avoid cold-start issues with coordinate-wise selection (see MEMORY.md).
             if k > 0 {
-                if use_spike_slab {
+                if use_horseshoe {
+                    fill_state_and_seasonal_residual(
+                        &mut residual,
+                        &y[..pre_end],
+                        &states,
+                        &s1_obs_pre,
+                        model.covariates(),
+                        &beta,
+                    );
+
+                    sample_horseshoe(
+                        &mut rng,
+                        &mut beta,
+                        &mut residual,
+                        model.covariates(),
+                        xtx_cache.as_ref().unwrap(),
+                        k,
+                        pre_end,
+                        sigma2_obs,
+                        hs.as_mut().unwrap(),
+                    );
+
+                    sigma2_obs = sample_sigma2_obs_seasonal(
+                        &mut rng,
+                        &y[..pre_end],
+                        &states,
+                        &s1_obs_pre,
+                        model.covariates(),
+                        &beta,
+                        y_sd,
+                        0.01,
+                    );
+                } else if use_spike_slab {
                     sigma2_obs = sample_sigma2_obs_seasonal(
                         &mut rng,
                         &y[..pre_end],
@@ -611,7 +748,11 @@ fn run_single_chain_static(
                 chain_result.sigma_level.push(sigma2_level.sqrt());
                 chain_result.sigma_seasonal.push(sigma2_seasonal.sqrt());
                 chain_result.beta.push(beta.clone());
-                if k > 0 {
+                if use_horseshoe {
+                    chain_result
+                        .kappa_shrinkage
+                        .push(hs.as_ref().unwrap().kappa());
+                } else if k > 0 {
                     chain_result.gamma.push(gamma.clone());
                 }
                 chain_result.predictions.push(predictions);
@@ -632,7 +773,63 @@ fn run_single_chain_static(
             );
 
             // Step 2-3: (sigma2_obs, gamma, beta) sampling
-            if k > 0 && use_spike_slab {
+            // Horseshoe Gibbs order: state → beta (joint) → lambda2/nu → tau2/xi → sigma2_obs
+            // Spike-slab Gibbs order: state → sigma2_obs → beta (coordinate-wise)
+            // See seasonal path comment above for rationale on the ordering difference.
+            if use_horseshoe {
+                fill_user_residual(
+                    &mut residual,
+                    &y[..pre_end],
+                    &states,
+                    model,
+                    &beta,
+                    &seasonal_beta,
+                );
+
+                sample_horseshoe(
+                    &mut rng,
+                    &mut beta,
+                    &mut residual,
+                    model.covariates(),
+                    xtx_cache.as_ref().unwrap(),
+                    k,
+                    pre_end,
+                    sigma2_obs,
+                    hs.as_mut().unwrap(),
+                );
+
+                if k_seasonal > 0 {
+                    let prior = seasonal_regression_prior
+                        .as_ref()
+                        .expect("seasonal regression prior must exist");
+                    fill_baseline_from_state_and_block(
+                        &mut baseline,
+                        &states,
+                        model.covariates(),
+                        &beta,
+                    );
+                    seasonal_beta = sample_beta_with_normal_prior(
+                        &mut rng,
+                        &y[..pre_end],
+                        &baseline,
+                        model.seasonal_covariates(),
+                        sigma2_obs,
+                        &prior.beta_mean,
+                        &prior.beta_precision,
+                    );
+                }
+
+                sigma2_obs = sample_sigma2_obs(
+                    &mut rng,
+                    &y[..pre_end],
+                    &states,
+                    model,
+                    &beta,
+                    &seasonal_beta,
+                    y_sd,
+                    0.01,
+                );
+            } else if k > 0 && use_spike_slab {
                 sigma2_obs = sample_sigma2_obs(
                     &mut rng,
                     &y[..pre_end],
@@ -807,7 +1004,11 @@ fn run_single_chain_static(
                 chain_result.sigma_obs.push(sigma2_obs.sqrt());
                 chain_result.sigma_level.push(sigma2_level.sqrt());
                 chain_result.beta.push(beta.clone());
-                if k > 0 {
+                if use_horseshoe {
+                    chain_result
+                        .kappa_shrinkage
+                        .push(hs.as_ref().unwrap().kappa());
+                } else if k > 0 {
                     chain_result.gamma.push(gamma.clone());
                 }
                 chain_result.predictions.push(predictions);
@@ -829,6 +1030,7 @@ fn flatten_chain_results(mut chain_results: Vec<ChainResult>, n_samples: usize) 
         beta: Vec::with_capacity(n_samples),
         gamma: Vec::with_capacity(n_samples),
         predictions: Vec::with_capacity(n_samples),
+        kappa_shrinkage: Vec::with_capacity(n_samples),
     };
 
     for chain_result in chain_results {
@@ -839,6 +1041,7 @@ fn flatten_chain_results(mut chain_results: Vec<ChainResult>, n_samples: usize) 
         result.beta.extend(chain_result.beta);
         result.gamma.extend(chain_result.gamma);
         result.predictions.extend(chain_result.predictions);
+        result.kappa_shrinkage.extend(chain_result.kappa_shrinkage);
     }
 
     result
@@ -1189,6 +1392,92 @@ fn sample_spike_and_slab<R: rand::Rng>(
             *r -= x_col[t] * beta[j];
         }
     }
+}
+
+/// Horseshoe prior sampling (Makalic & Schmidt 2015 auxiliary variable scheme).
+///
+/// Joint update of beta via precision sampler, then per-coordinate
+/// updates of lambda2, nu, tau2, xi from InvGamma conditionals.
+#[allow(clippy::too_many_arguments)]
+fn sample_horseshoe<R: rand::Rng>(
+    rng: &mut R,
+    beta: &mut Vec<f64>,
+    residual: &mut [f64],
+    x: &[Vec<f64>],
+    xtx: &[Vec<f64>],
+    k: usize,
+    pre_end: usize,
+    sigma2_obs: f64,
+    hs: &mut HorseshoeState,
+) {
+    // 1. Build precision: A = X'X + diag(1 / (lambda2[j] * tau2))
+    // Clamp the derived precision diagonal, NOT the raw draws (lambda2, tau2).
+    // Clamping raw draws would distort the posterior. The floor 1e-30 prevents
+    // zero-division; the ceiling 1e12 prevents inf in the Cholesky input.
+    // kappa() uses the same 1e-30 floor to stay consistent with the actual A.
+    let mut precision = vec![vec![0.0; k]; k];
+    for i in 0..k {
+        for j in 0..k {
+            precision[i][j] = xtx[i][j];
+        }
+        let lambda_tau_prod = (hs.lambda2[i] * hs.tau2).max(1e-30);
+        let prior_prec = (1.0 / lambda_tau_prod).min(1e12);
+        precision[i][i] += prior_prec;
+    }
+
+    // 2. Compute rhs = X'residual + X'X * beta (add back beta contribution)
+    let mut xtr = vec![0.0; k];
+    for (j, x_col) in x.iter().enumerate() {
+        let xtr_residual: f64 = x_col
+            .iter()
+            .zip(residual.iter())
+            .take(pre_end)
+            .map(|(x_val, r_val)| x_val * r_val)
+            .sum();
+        let xtx_beta: f64 = xtx[j]
+            .iter()
+            .zip(beta.iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        xtr[j] = xtr_residual + xtx_beta;
+    }
+
+    // 3. Sample beta ~ N(A^{-1}b, sigma2_obs * A^{-1})
+    let new_beta = sample_from_precision(rng, &precision, &xtr, sigma2_obs);
+
+    // 4. Update residual with new beta
+    for (t, r) in residual.iter_mut().enumerate().take(pre_end) {
+        for (j, x_col) in x.iter().enumerate() {
+            *r += x_col[t] * beta[j] - x_col[t] * new_beta[j];
+        }
+    }
+    *beta = new_beta;
+
+    // 5. Per-coordinate: lambda2[j] ~ IG(1, 1/nu[j] + beta[j]^2 / (2*tau2*sigma2))
+    for j in 0..k {
+        let scale = 1.0 / hs.nu[j] + beta[j] * beta[j] / (2.0 * hs.tau2 * sigma2_obs);
+        hs.lambda2[j] = sample_inv_gamma(rng, 1.0, scale);
+    }
+
+    // 6. Per-coordinate: nu[j] ~ IG(1, 1 + 1/lambda2[j])
+    for j in 0..k {
+        let scale = 1.0 + 1.0 / hs.lambda2[j];
+        hs.nu[j] = sample_inv_gamma(rng, 1.0, scale);
+    }
+
+    // 7. Global: tau2 ~ IG((k+1)/2, 1/xi + sum(beta[j]^2 / (2*lambda2[j]*sigma2)))
+    let sum_beta2_over_lambda2: f64 = beta
+        .iter()
+        .zip(hs.lambda2.iter())
+        .map(|(&b, &l2)| b * b / (2.0 * l2 * sigma2_obs))
+        .sum();
+    let tau2_shape = (k as f64 + 1.0) / 2.0;
+    let tau2_scale = 1.0 / hs.xi + sum_beta2_over_lambda2;
+    hs.tau2 = sample_inv_gamma(rng, tau2_shape, tau2_scale);
+
+    // 8. Global: xi ~ IG(1, 1 + 1/tau2)
+    let xi_scale = 1.0 + 1.0 / hs.tau2;
+    hs.xi = sample_inv_gamma(rng, 1.0, xi_scale);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1629,6 +1918,7 @@ pub fn run_placebo_test(
     let y_pre = &y[..pre_end];
 
     // Compute real effect: run sampler on full y with real pre_end
+    // Placebo test always uses spike_slab prior
     let real_model = StateSpaceModel::new(y.len(), x.clone(), seasonal);
     let real_chain = run_single_chain(
         y,
@@ -1642,6 +1932,7 @@ pub fn run_placebo_test(
         expected_model_size,
         false, // static only for placebo
         state_model,
+        PriorType::SpikeSlab,
     );
     let real_effect_abs = compute_abs_average_effect(
         &y[pre_end..],
@@ -1682,6 +1973,7 @@ pub fn run_placebo_test(
                 expected_model_size,
                 false,
                 state_model,
+                PriorType::SpikeSlab,
             );
             compute_abs_average_effect(&y_pre[split..], &chain.predictions)
         })
@@ -1751,6 +2043,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         )
         .unwrap();
         assert_eq!(result.states.len(), 10);
@@ -1778,6 +2071,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         )
         .unwrap();
         assert_eq!(result.beta.len(), 10);
@@ -1802,6 +2096,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         );
         assert!(result.is_err());
     }
@@ -1824,6 +2119,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         );
         assert!(result.is_ok());
         let gibbs = result.unwrap();
@@ -1850,6 +2146,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         );
         assert!(result.is_err());
     }
@@ -1873,6 +2170,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         );
         assert!(result.is_err());
         // k>0 with negative should fail
@@ -1890,6 +2188,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         );
         assert!(result.is_err());
     }
@@ -1951,6 +2250,7 @@ mod tests {
             None,
             true,
             "local_level",
+            PriorType::SpikeSlab,
         )
         .unwrap();
         assert_eq!(result.predictions.len(), 10);
@@ -1976,6 +2276,7 @@ mod tests {
             None,
             true,
             "local_level",
+            PriorType::SpikeSlab,
         )
         .unwrap();
         let result_static = run_sampler(
@@ -1992,6 +2293,7 @@ mod tests {
             None,
             false,
             "local_level",
+            PriorType::SpikeSlab,
         )
         .unwrap();
         // With k=0, both paths should produce identical predictions
@@ -2019,6 +2321,7 @@ mod tests {
             None,
             true,
             "local_level",
+            PriorType::SpikeSlab,
         )
         .unwrap();
         for pred_row in &result.predictions {
@@ -2045,6 +2348,7 @@ mod tests {
             None,
             false,
             "local_linear_trend",
+            PriorType::SpikeSlab,
         )
         .unwrap();
 
@@ -2209,5 +2513,35 @@ mod tests {
         let val = sample_sigma2_seasonal(&mut rng, 0.0, 0, 1e-10, 1.0);
         assert!(val.is_finite(), "must be finite for tiny prior_level_sd");
         assert!(val > 0.0);
+    }
+
+    #[test]
+    fn test_run_sampler_rejects_covariate_length_mismatch() {
+        let y: Vec<f64> = (0..20).map(|i| 10.0 + 0.1 * i as f64).collect();
+        let x_short = vec![(0..10).map(|i| i as f64 * 0.1).collect()];
+        let result = run_sampler(
+            &y,
+            x_short,
+            15,
+            10,
+            5,
+            1,
+            42,
+            0.01,
+            1.0,
+            None,
+            None,
+            false,
+            "local_level",
+            PriorType::SpikeSlab,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err but got Ok"),
+        };
+        assert!(
+            err.contains("covariate column 0 has length 10 but y has length 20"),
+            "unexpected error message: {err}"
+        );
     }
 }

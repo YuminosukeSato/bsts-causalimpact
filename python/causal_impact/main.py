@@ -34,6 +34,7 @@ DEFAULT_MODEL_ARGS = {
     "expected_model_size": 2,
     "dynamic_regression": False,
     "state_model": "local_level",
+    "prior_type": "spike_slab",
     "nseasons": None,
     "season_duration": None,
 }
@@ -43,25 +44,32 @@ def _normalize_model_args(
     model_args: dict | ModelOptions | None,
 ) -> dict:
     if isinstance(model_args, ModelOptions):
-        args = model_args.to_dict()
-    else:
-        args = dict(model_args or {})
+        return model_args.to_dict()
 
-    if "season.duration" in args:
-        if "season_duration" in args:
+    raw = dict(model_args or {})
+
+    if "season.duration" in raw:
+        if "season_duration" in raw:
             msg = "Use either season.duration or season_duration, not both"
             raise ValueError(msg)
-        args["season_duration"] = args.pop("season.duration")
+        raw["season_duration"] = raw.pop("season.duration")
 
-    normalized = {**DEFAULT_MODEL_ARGS, **args}
-    if normalized["state_model"] not in {"local_level", "local_linear_trend"}:
-        msg = (
-            "state_model must be one of "
-            "{'local_level', 'local_linear_trend'}, "
-            f"got {normalized['state_model']}"
-        )
-        raise ValueError(msg)
-    return normalized
+    # mode は ModelOptions のフィールドではないため先に抽出する
+    mode = raw.pop("mode", None)
+
+    _allowed = set(DEFAULT_MODEL_ARGS)
+    unknown = set(raw) - _allowed
+    if unknown:
+        raise ValueError(f"Unknown model_args keys: {sorted(unknown)}")
+
+    # ModelOptions を経由することで __post_init__ のバリデーションを全て通す
+    merged = {**DEFAULT_MODEL_ARGS, **raw}
+    opts = ModelOptions(**merged)
+
+    result = opts.to_dict()
+    if mode is not None:
+        result["mode"] = mode
+    return result
 
 
 class CausalImpact:
@@ -93,6 +101,12 @@ class CausalImpact:
             msg = (
                 "dynamic_regression is not supported in retrospective mode. "
                 "Use mode='forward' for time-varying coefficients."
+            )
+            raise ValueError(msg)
+        if mode == "retrospective" and args.get("prior_type") == "horseshoe":
+            msg = (
+                "horseshoe prior is not supported in retrospective mode. "
+                "Use prior_type='spike_slab' or mode='forward'."
             )
             raise ValueError(msg)
 
@@ -143,6 +157,7 @@ class CausalImpact:
             season_duration=args["season_duration"],
             dynamic_regression=bool(args.get("dynamic_regression", False)),
             state_model=str(args["state_model"]),
+            prior_type=str(args.get("prior_type", "spike_slab")),
         )
 
     def _run_retrospective(self, prepared: PreparedData, args: dict):
@@ -295,12 +310,32 @@ class CausalImpact:
     def posterior_inclusion_probs(self) -> np.ndarray | None:
         """Posterior inclusion probabilities for each covariate.
 
-        Returns None when there are no covariates (k=0).
+        Only available for prior_type='spike_slab'. Returns None for
+        horseshoe prior or when there are no covariates (k=0).
         """
+        if self._model_args.get("prior_type", "spike_slab") == "horseshoe":
+            return None
         gamma = self._samples.gamma
         if not gamma or not gamma[0]:
             return None
         return np.array(gamma).mean(axis=0)
+
+    @property
+    def posterior_shrinkage(self) -> np.ndarray | None:
+        """Mean shrinkage factor per covariate (horseshoe prior only).
+
+        kappa_j = E[1 / (1 + lambda_j^2 * tau^2)].
+        Values close to 1 indicate strong shrinkage (covariate excluded).
+        Values close to 0 indicate weak shrinkage (covariate included).
+
+        Returns None for spike_slab prior or when there are no covariates.
+        """
+        if self._model_args.get("prior_type", "spike_slab") != "horseshoe":
+            return None
+        kappa = self._samples.kappa_shrinkage
+        if not kappa or not kappa[0]:
+            return None
+        return np.array(kappa).mean(axis=0)
 
     @property
     def summary_stats(self) -> dict:

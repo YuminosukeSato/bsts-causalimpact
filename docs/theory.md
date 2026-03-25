@@ -10,6 +10,7 @@ Five additional capabilities extend the analysis beyond what R offers.
 | Placebo test | `ci.run_placebo_test()` | Validate effects against null distribution |
 | Conformal inference | `ci.run_conformal_analysis()` | Distribution-free prediction intervals |
 | DTW control selection | `select_controls()` | Automatic covariate selection |
+| Horseshoe prior | `ModelOptions(prior_type='horseshoe')` | Continuous shrinkage for dense DGP |
 
 ---
 
@@ -242,6 +243,166 @@ ci = CausalImpact(analysis_data, pre_period, post_period)
 
 Reference: Sakoe & Chiba (1978), "Dynamic programming algorithm optimization
 for spoken word recognition."
+
+---
+
+## Horseshoe Prior
+
+### What it does
+
+The horseshoe prior (Carvalho, Polson & Scott 2010) is a continuous shrinkage
+alternative to spike-and-slab variable selection. While spike-and-slab performs
+discrete inclusion/exclusion of covariates (gamma_j in {0,1}), the horseshoe
+applies adaptive shrinkage that can handle dense DGP settings where many
+covariates have true effects.
+
+Reference: Kohns & Bhattacharjee (2022), "Horseshoe Prior for Sparse Bayesian
+Structural Time Series" (arXiv:2011.00938).
+
+### Hierarchical model
+
+The horseshoe hierarchy uses Half-Cauchy priors decomposed into InvGamma
+auxiliary variables (Makalic & Schmidt 2015):
+
+```
+beta_j | lambda_j, tau, sigma2  ~ N(0, lambda_j^2 * tau^2 * sigma2_obs)
+lambda_j^2 | nu_j               ~ InvGamma(1/2, 1/nu_j)
+nu_j                             ~ InvGamma(1/2, 1)
+tau^2 | xi                       ~ InvGamma(1/2, 1/xi)
+xi                               ~ InvGamma(1/2, 1)
+```
+
+The conditional posteriors used in the Gibbs sampler:
+
+```
+lambda_j^2 | .  ~ InvGamma(1,       1/nu_j + beta_j^2 / (2 * tau^2 * sigma2))
+nu_j       | .  ~ InvGamma(1,       1 + 1/lambda_j^2)
+tau^2      | .  ~ InvGamma((k+1)/2, 1/xi + sum(beta_j^2 / (2 * lambda_j^2 * sigma2)))
+xi         | .  ~ InvGamma(1,       1 + 1/tau^2)
+```
+
+### Beta joint update
+
+Unlike spike-and-slab (coordinate-wise), horseshoe uses a joint beta update:
+
+```
+A = X'X + diag(1 / (lambda_j^2 * tau^2))    (precision matrix)
+b = X'(y - state - seasonal)                 (right-hand side)
+beta ~ N(A^{-1} b, sigma2_obs * A^{-1})     (sampled via Cholesky)
+```
+
+### Shrinkage factor
+
+The shrinkage factor kappa_j measures how much each covariate is shrunk:
+
+```
+kappa_j = 1 / (1 + lambda_j^2 * tau^2)
+```
+
+- kappa_j close to 1: strong shrinkage (covariate effectively excluded)
+- kappa_j close to 0: weak shrinkage (covariate effectively included)
+
+The `posterior_shrinkage` property returns E[kappa_j] averaged over post-warmup
+MCMC iterations.
+
+### When to use
+
+| Scenario | Recommended prior |
+|---|---|
+| Few true covariates among many candidates (sparse DGP) | `spike_slab` (default) |
+| Many covariates with true effects (dense DGP) | `horseshoe` |
+| Time-varying coefficients | `spike_slab` (horseshoe + dynamic_regression not supported) |
+
+### Usage
+
+```python
+from causal_impact import CausalImpact, ModelOptions
+
+ci = CausalImpact(
+    data, pre_period, post_period,
+    model_args=ModelOptions(prior_type='horseshoe', niter=2000, seed=42),
+)
+
+# Shrinkage diagnostics
+print(ci.posterior_shrinkage)   # E[kappa_j] per covariate
+# posterior_inclusion_probs is None for horseshoe
+```
+
+### Implementation decisions not specified in the papers
+
+The following design choices are not prescribed by the reference papers.
+Each choice is documented here with its rationale so that reviewers can
+evaluate them independently.
+
+#### tau0 initialization
+
+The global shrinkage parameter tau^2 requires an initial value for the
+Gibbs sampler.  None of the three reference papers specify a concrete
+formula.  This implementation uses a data-adaptive heuristic:
+
+```
+y_norm = ||y_pre||_2 / sqrt(T_pre)
+tau0   = y_sd / (sqrt(k) * y_norm)
+tau^2_init = tau0^2
+```
+
+Rationale: after standardization y_sd is approximately 1.  Dividing by
+sqrt(k) prevents the global scale from growing with the number of
+covariates.  Dividing by y_norm anchors the prior scale to the signal
+magnitude.  Because tau^2 is resampled at every Gibbs iteration, the
+chain forgets the initial value within the warmup period.  If y_norm
+is near zero (constant y), tau0 falls back to 1.0 so that the prior
+remains diffuse.
+
+#### Numerical clamping on derived precision (not on raw draws)
+
+Raw InvGamma draws for lambda_j^2 and tau^2 receive no floor.  Clamping
+raw draws would distort the posterior distribution.  Instead, the derived
+precision diagonal entry is clamped:
+
+```
+lambda_tau_prod = max(lambda_j^2 * tau^2, 1e-30)   -- prevents 0-division
+prior_prec      = min(1 / lambda_tau_prod, 1e12)    -- prevents inf diagonal
+```
+
+This approach keeps the posterior intact while protecting the Cholesky
+decomposition from numerical failure.  The kappa() diagnostic uses the
+same 1e-30 floor so that shrinkage values stay consistent with the
+precision matrix actually used in the beta update.
+
+The fallback in sample_inv_gamma (returning 1e-30 for non-finite
+parameters) serves as a last-resort guard.  It triggers only under
+extreme-scale inputs (e.g. standardize_data=False with y of order 1e200)
+where the scale parameter overflows to infinity.
+
+#### Gibbs sampling order
+
+Horseshoe and spike-and-slab use different orderings within the Gibbs loop:
+
+```
+Horseshoe:   state -> beta (joint)   -> lambda2/nu -> tau2/xi -> sigma2_obs
+Spike-slab:  state -> sigma2_obs     -> beta (coordinate-wise)
+```
+
+Horseshoe samples beta jointly via a precision matrix conditioned on the
+current sigma2_obs.  After the joint beta update, sigma2_obs is resampled
+conditioned on the updated residual.  This follows Algorithm 1 of Makalic
+& Schmidt (2015) where the regression step precedes the variance update.
+
+Spike-and-slab samples sigma2_obs first because its coordinate-wise
+variable selection (gamma_j) is sensitive to cold-start: sampling beta
+with an uninformative sigma2_obs on the first iteration can cause the
+sampler to exclude all covariates.  Sampling sigma2_obs first gives beta
+a reasonable scale to condition on.
+
+### References
+
+- Carvalho, C.M., Polson, N.G. & Scott, J.G. (2010). The horseshoe estimator
+  for sparse signals. Biometrika, 97(2), 465-480.
+- Kohns, D. & Bhattacharjee, A. (2022). Horseshoe Prior for Sparse Bayesian
+  Structural Time Series. arXiv:2011.00938.
+- Makalic, E. & Schmidt, D.F. (2015). A simple sampler for the horseshoe
+  estimator. IEEE Signal Processing Letters, 23(1), 179-182.
 
 ---
 

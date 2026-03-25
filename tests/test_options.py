@@ -232,6 +232,7 @@ class TestToDict:
             "expected_model_size",
             "dynamic_regression",
             "state_model",
+            "prior_type",
             "nseasons",
             "season_duration",
         }
@@ -261,6 +262,38 @@ def _make_test_data():
     pre = ["2020-01-01", "2020-02-25"]
     post = ["2020-02-26", "2020-03-20"]
     return df, pre, post
+
+
+# ---------------------------------------------------------------------------
+# Boundary: prior_type
+# ---------------------------------------------------------------------------
+
+
+class TestPriorTypeBoundary:
+    def test_prior_type_default_is_spike_slab(self):
+        opts = ModelOptions()
+        assert opts.prior_type == "spike_slab"
+
+    def test_prior_type_horseshoe_is_valid(self):
+        opts = ModelOptions(prior_type="horseshoe")
+        assert opts.prior_type == "horseshoe"
+
+    def test_prior_type_spike_slab_is_valid(self):
+        opts = ModelOptions(prior_type="spike_slab")
+        assert opts.prior_type == "spike_slab"
+
+    def test_prior_type_invalid_raises(self):
+        with pytest.raises(ValueError, match="prior_type"):
+            ModelOptions(prior_type="ridge")
+
+    def test_prior_type_in_to_dict(self):
+        d = ModelOptions().to_dict()
+        assert "prior_type" in d
+        assert d["prior_type"] == "spike_slab"
+
+    def test_horseshoe_with_dynamic_regression_raises(self):
+        with pytest.raises(ValueError):
+            ModelOptions(prior_type="horseshoe", dynamic_regression=True)
 
 
 class TestBackwardCompatibility:
@@ -314,3 +347,41 @@ class TestBackwardCompatibility:
             },
         )
         assert ci.summary() is not None
+
+
+class TestDictValidation:
+    """dict path runs ModelOptions.__post_init__ validation."""
+
+    @pytest.mark.parametrize(
+        ("key", "bad_value", "match"),
+        [
+            ("niter", 0, "niter must be >= 1"),
+            ("nwarmup", -1, "nwarmup must be >= 0"),
+            ("nchains", 0, "nchains must be >= 1"),
+            ("prior_level_sd", 0.0, "prior_level_sd must be > 0"),
+            ("expected_model_size", 0, "expected_model_size must be > 0"),
+            ("state_model", "bad", "state_model must be one of"),
+            ("prior_type", "bad", "prior_type must be"),
+            ("dynamic_regression", "yes", "dynamic_regression must be a bool"),
+        ],
+    )
+    def test_invalid_dict_raises(self, key: str, bad_value: object, match: str) -> None:
+        df, pre, post = _make_test_data()
+        with pytest.raises(ValueError, match=match):
+            CausalImpact(df, pre, post, model_args={key: bad_value})
+
+    def test_dict_nseasons_without_value_raises(self) -> None:
+        df, pre, post = _make_test_data()
+        with pytest.raises(ValueError, match="season_duration must be"):
+            CausalImpact(
+                df, pre, post, model_args={"nseasons": 7, "season_duration": 0}
+            )
+
+    def test_dict_season_duration_without_nseasons_raises(self) -> None:
+        df, pre, post = _make_test_data()
+        with pytest.raises(ValueError, match="nseasons must be provided"):
+            CausalImpact(df, pre, post, model_args={"season_duration": 1})
+
+    def test_model_options_rejects_mode_kwarg(self) -> None:
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            ModelOptions(mode="retrospective")  # type: ignore[call-arg]

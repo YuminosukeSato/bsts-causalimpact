@@ -357,6 +357,84 @@ class TestSamplerErrors:
             )
 
 
+class TestSamplerKappaShrinkage:
+    """kappa_shrinkage field tests for horseshoe/spike-slab."""
+
+    def test_sampler_horseshoe_returns_kappa_shrinkage_field(self):
+        """R1: horseshoe returns kappa_shrinkage with correct length."""
+        y = [10.0 + 0.1 * i for i in range(50)]
+        x1 = [0.5 * i for i in range(50)]
+        x2 = [0.3 * i for i in range(50)]
+        result = run_gibbs_sampler(
+            y=y,
+            x=[x1, x2],
+            pre_end=35,
+            niter=50,
+            nwarmup=10,
+            nchains=1,
+            seed=42,
+            prior_level_sd=0.01,
+            prior_type="horseshoe",
+        )
+        assert hasattr(result, "kappa_shrinkage")
+        assert len(result.kappa_shrinkage) == 50
+        assert len(result.kappa_shrinkage[0]) == 2
+
+    def test_sampler_spike_slab_kappa_shrinkage_is_empty_list(self):
+        """R2: spike_slab (default) returns empty kappa_shrinkage."""
+        y = [10.0 + 0.1 * i for i in range(50)]
+        x1 = [0.5 * i for i in range(50)]
+        x2 = [0.3 * i for i in range(50)]
+        result = run_gibbs_sampler(
+            y=y,
+            x=[x1, x2],
+            pre_end=35,
+            niter=50,
+            nwarmup=10,
+            nchains=1,
+            seed=42,
+            prior_level_sd=0.01,
+        )
+        assert result.kappa_shrinkage == []
+
+    def test_sampler_no_covariates_horseshoe_kappa_is_empty(self):
+        """R3: k=0 with horseshoe returns empty kappa_shrinkage."""
+        y = [10.0 + 0.1 * i for i in range(50)]
+        result = run_gibbs_sampler(
+            y=y,
+            x=None,
+            pre_end=35,
+            niter=50,
+            nwarmup=10,
+            nchains=1,
+            seed=42,
+            prior_level_sd=0.01,
+            prior_type="horseshoe",
+        )
+        assert result.kappa_shrinkage == []
+
+
+class TestSamplerCovariateValidation:
+    """Covariate shape validation at PyO3 boundary."""
+
+    def test_sampler_rejects_covariate_length_mismatch(self):
+        y = [1.0, 2.0, 3.0, 4.0, 5.0]
+        x_wrong = [[0.1, 0.2, 0.3]]  # length 3, y length 5
+        with pytest.raises(
+            ValueError, match="covariate column 0 has length 3 but y has length 5"
+        ):
+            run_gibbs_sampler(
+                y=y,
+                x=x_wrong,
+                pre_end=3,
+                niter=5,
+                nwarmup=0,
+                nchains=1,
+                seed=42,
+                prior_level_sd=0.01,
+            )
+
+
 class TestSamplerConvergence:
     """Estimation accuracy on known signals."""
 

@@ -100,6 +100,7 @@ Posterior prob. of a causal effect: 99.90%
 | Algorithm | Gibbs (bsts/C++) | Gibbs (Rust) | TFP-based | VI default / HMC | MLE (statsmodels) |
 | Dependencies | R, bsts | numpy, pandas, matplotlib | TF, TFP (3 GB+) | TF, TFP (3 GB+) | statsmodels |
 | Spike-and-slab | Yes | Yes | Unknown | No | No |
+| Horseshoe prior | No | Yes (`prior_type='horseshoe'`) | No | No | No |
 | Seasonal component | Yes | Yes (`nseasons`, `season_duration`) | Unknown | Yes (TFP STS) | No |
 | Dynamic regression | Yes | Yes (`dynamic_regression=True`) | Unknown | No | No |
 | R numerical test | Reference | ±1% CI-enforced + TOST/ROPE | Not published | Visual comparison (~8% diff) | Not tested |
@@ -205,6 +206,7 @@ Evidence per implementation (all verified from source code, not documentation cl
 | DATE decomposition | Extended | Decomposes effects into spot/persistent/trend (arXiv:2602.00836) |
 | Retrospective mode | Extended | Treatment indicators as covariates; effects from beta posteriors (arXiv:2602.00836) |
 | Placebo test | Extended | Null distribution from pre-period splits |
+| Horseshoe prior | Extended | Continuous shrinkage alternative to spike-and-slab (Kohns & Bhattacharjee 2022) |
 | Conformal inference | Extended | Distribution-free prediction intervals |
 | DTW control selection | Extended | Automatic covariate selection via Dynamic Time Warping |
 
@@ -223,6 +225,7 @@ Features that go beyond R's CausalImpact. These have no R equivalent.
 | Placebo test | `ci.run_placebo_test()` | Validates effect against null distribution from pre-period splits | |
 | Conformal inference | `ci.run_conformal_analysis()` | Distribution-free prediction intervals | Vovk et al. (2005) |
 | DTW control selection | `select_controls()` | Automatic covariate selection via Dynamic Time Warping | Sakoe & Chiba (1978) |
+| Horseshoe prior | `ModelOptions(prior_type='horseshoe')` | Continuous shrinkage alternative to spike-and-slab for dense DGP | Kohns & Bhattacharjee (2022), arXiv:2011.00938 |
 
 ## API
 
@@ -251,6 +254,7 @@ Features that go beyond R's CausalImpact. These have no R equivalent.
 | `season_duration` | `None` | Optional duration of each seasonal block; defaults to `1` when `nseasons` is set |
 | `dynamic_regression` | `False` | Enable time-varying regression coefficients (random-walk beta) |
 | `state_model` | `"local_level"` | `"local_level"` or `"local_linear_trend"` |
+| `prior_type` | `"spike_slab"` | `"spike_slab"` or `"horseshoe"` (continuous shrinkage for dense DGP) |
 | `mode` | `"forward"` | `"forward"` (counterfactual prediction) or `"retrospective"` (treatment indicators as covariates) |
 
 #### Methods and Properties
@@ -262,7 +266,8 @@ Features that go beyond R's CausalImpact. These have no R equivalent.
 | `plot(metrics=None)` | `Figure` | Matplotlib figure with original/pointwise/cumulative panels |
 | `inferences` | `DataFrame` | Per-timestep actuals, predictions, prediction s.d., and effect intervals |
 | `summary_stats` | `dict` | Aggregate statistics (effect mean, CI, p-value, etc.) |
-| `posterior_inclusion_probs` | `ndarray \| None` | Posterior inclusion probability per covariate |
+| `posterior_inclusion_probs` | `ndarray \| None` | Posterior inclusion probability per covariate (spike-and-slab only) |
+| `posterior_shrinkage` | `ndarray \| None` | Mean shrinkage factor per covariate (horseshoe only) |
 | `decompose(alpha=None)` | `DateDecomposition` | DATE decomposition into spot/persistent/trend components |
 | `run_placebo_test(...)` | `PlaceboTestResults` | Placebo test for effect validation |
 | `run_conformal_analysis(...)` | `ConformalResults` | Distribution-free conformal prediction intervals |
