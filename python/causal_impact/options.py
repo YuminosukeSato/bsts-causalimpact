@@ -21,10 +21,23 @@ class ModelOptions:
     expected_model_size: int = 2
     dynamic_regression: bool = False
     state_model: str = "local_level"
+    prior_type: str = "spike_slab"
     nseasons: int | None = None
     season_duration: int | None = None
 
     def __post_init__(self) -> None:
+        if self.prior_type not in {"spike_slab", "horseshoe"}:
+            msg = (
+                "prior_type must be 'spike_slab' or 'horseshoe', "
+                f"got {self.prior_type!r}"
+            )
+            raise ValueError(msg)
+        if self.prior_type == "horseshoe" and self.dynamic_regression:
+            msg = (
+                "horseshoe prior is not supported with dynamic_regression=True. "
+                "Use prior_type='spike_slab' for time-varying coefficients."
+            )
+            raise ValueError(msg)
         if self.niter < 1:
             msg = f"niter must be >= 1, got {self.niter}"
             raise ValueError(msg)
