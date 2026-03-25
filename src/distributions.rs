@@ -4,8 +4,21 @@ use rand::Rng;
 use rand_distr::{Gamma, StandardNormal};
 
 pub fn sample_inv_gamma<R: Rng>(rng: &mut R, shape: f64, scale: f64) -> f64 {
-    let gamma = Gamma::new(shape, 1.0 / scale).expect("Invalid Gamma parameters");
+    // Guard against non-finite or non-positive parameters.
+    // When scale → inf (e.g. from extreme-scale horseshoe updates),
+    // IG(shape, inf) concentrates at 0; return a small positive value.
+    if !shape.is_finite() || shape <= 0.0 || !scale.is_finite() || scale <= 0.0 {
+        return 1e-30;
+    }
+    let rate = 1.0 / scale;
+    if !rate.is_finite() || rate <= 0.0 {
+        return 1e-30;
+    }
+    let gamma = Gamma::new(shape, rate).expect("Invalid Gamma parameters");
     let x: f64 = rng.sample(gamma);
+    if !x.is_finite() || x <= 0.0 {
+        return 1e-30;
+    }
     1.0 / x
 }
 

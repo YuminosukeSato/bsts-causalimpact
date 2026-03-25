@@ -28,6 +28,8 @@ pub struct GibbsSamples {
     pub gamma: Vec<Vec<bool>>,
     #[pyo3(get)]
     pub predictions: Vec<Vec<f64>>,
+    #[pyo3(get)]
+    pub kappa_shrinkage: Vec<Vec<f64>>,
 }
 
 #[pyfunction]
@@ -45,7 +47,8 @@ pub struct GibbsSamples {
         nseasons=None,
         season_duration=None,
         dynamic_regression=false,
-        state_model="local_level"
+        state_model="local_level",
+        prior_type="spike_slab"
     )
 )]
 #[allow(clippy::too_many_arguments)]
@@ -63,10 +66,13 @@ fn run_gibbs_sampler(
     season_duration: Option<f64>,
     dynamic_regression: bool,
     state_model: &str,
+    prior_type: &str,
 ) -> PyResult<GibbsSamples> {
     let y_values = extract_series(y)?;
     let y_slice = y_values.as_slice()?;
     let x_vecs = extract_covariates(x)?;
+    let prior = sampler::PriorType::from_str(prior_type)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
     let result = sampler::run_sampler(
         y_slice,
@@ -82,6 +88,7 @@ fn run_gibbs_sampler(
         season_duration,
         dynamic_regression,
         state_model,
+        prior,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
@@ -93,6 +100,7 @@ fn run_gibbs_sampler(
         beta: result.beta,
         gamma: result.gamma,
         predictions: result.predictions,
+        kappa_shrinkage: result.kappa_shrinkage,
     })
 }
 
