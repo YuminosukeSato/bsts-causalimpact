@@ -437,8 +437,131 @@ print(ci.posterior_inclusion_probs)
 | No Effect (negative control) | 0.0 | -0.55 | [-1.50, 0.48] | 0.118 | No (correct) |
 | Multiple Covariates | 5.0 | 6.53 | [3.64, 9.67] | 0.001 | Yes |
 
-All six examples produce correct results:
+---
+
+## 7. DATE Decomposition (Spot / Persistent / Trend)
+
+Decompose the estimated causal effect into three interpretable components.
+This example uses synthetic data with a known persistent effect of +3 and
+a trend of +0.1 per time step.
+
+Reference: Schaffe-Odeleye et al. (2026), arXiv:2602.00836.
+
+```python
+rng = np.random.default_rng(42)
+
+n_pre, n_post = 100, 30
+n = n_pre + n_post
+x = np.zeros(n)
+x[0] = 100
+for t in range(1, n):
+    x[t] = 0.999 * x[t - 1] + rng.normal(0, 1)
+
+y = 1.2 * x + rng.normal(0, 1, size=n)
+# Inject a persistent shift + trend
+y[n_pre:] += 3.0 + 0.1 * np.arange(n_post)
+
+dates = pd.date_range("2020-01-01", periods=n, freq="D")
+data = pd.DataFrame({"y": y, "x": x}, index=dates)
+pre_period = ["2020-01-01", "2020-04-09"]
+post_period = ["2020-04-10", "2020-05-09"]
+
+ci = CausalImpact(data, pre_period, post_period, model_args={"seed": 42})
+dec = ci.decompose()
+
+print(f"Spot:       {dec.spot.coefficient:+.2f}  [{dec.spot.ci_lower:+.2f}, {dec.spot.ci_upper:+.2f}]")
+print(f"Persistent: {dec.persistent.coefficient:+.2f}  [{dec.persistent.ci_lower:+.2f}, {dec.persistent.ci_upper:+.2f}]")
+if dec.trend is not None:
+    print(f"Trend:      {dec.trend.coefficient:+.2f}  [{dec.trend.ci_lower:+.2f}, {dec.trend.ci_upper:+.2f}]")
+```
+
+### Interpreting the results
+
+| Component | True value | What it means |
+|---|---|---|
+| Spot | 0.0 | No immediate one-time impact |
+| Persistent | 3.0 | Permanent baseline shift |
+| Trend | 0.1 | Effect grows by 0.1 per time step |
+
+### Plotting with decomposition
+
+```python
+fig = ci.plot(metrics=["original", "pointwise", "cumulative", "decomposition"])
+fig.savefig("example_decomposition.png", dpi=150, bbox_inches="tight")
+```
+
+The fourth panel shows the three components with credible intervals.
+
+---
+
+## 8. Retrospective Attribution Mode
+
+In retrospective mode, treatment indicator columns (spot, persistent, trend)
+are added as covariates and the model is fit on the entire time series.
+Treatment effects are extracted directly from the beta posteriors.
+
+This approach avoids the counterfactual prediction step of forward mode and
+instead estimates treatment effects within a single model fit.
+
+```python
+import numpy as np
+import pandas as pd
+from causal_impact import CausalImpact
+
+rng = np.random.default_rng(42)
+
+n_pre, n_post = 200, 50
+n = n_pre + n_post
+y = np.cumsum(rng.normal(0, 0.3, n)) + 50
+y += rng.normal(0, 0.5, n)
+# Inject a persistent level shift of +5 at intervention
+y[n_pre:] += 5.0
+
+dates = pd.date_range("2020-01-01", periods=n, freq="D")
+data = pd.DataFrame({"y": y}, index=dates)
+pre_period = [dates[0], dates[n_pre - 1]]
+post_period = [dates[n_pre], dates[-1]]
+
+ci = CausalImpact(
+    data, pre_period, post_period,
+    model_args={
+        "niter": 2000, "nwarmup": 1000, "seed": 42,
+        "mode": "retrospective",
+        "prior_level_sd": 0.001,
+    },
+)
+
+# Decomposition is auto-populated in retrospective mode
+dec = ci._decomposition
+print(f"Spot:       {dec.spot.coefficient:+.2f}")
+print(f"Persistent: {dec.persistent.coefficient:+.2f}")
+if dec.trend is not None:
+    print(f"Trend:      {dec.trend.coefficient:+.2f}")
+
+# Standard summary and plot still work
+print(ci.summary())
+fig = ci.plot()
+```
+
+### When to use retrospective mode
+
+- Forward mode (default): Use when you have a clear pre/post split and want counterfactual predictions. Standard CausalImpact workflow.
+- Retrospective mode: Use when you want to decompose the treatment effect into spot/persistent/trend directly from the model, or when the treatment timing is known and you want a single-model-fit approach.
+
+### Note on `prior_level_sd`
+
+In retrospective mode, the local level state (random walk) and the persistent
+treatment indicator (step function) are partially collinear. Setting
+`prior_level_sd` to a small value (e.g., 0.001) constrains the state variation
+and forces the model to attribute level shifts to the treatment columns.
+
+---
+
+## Summary of All Examples
+
+All eight examples produce correct results:
 
 - When there is a true effect, the 95% credible interval contains the true value
 - When there is no effect, the model correctly reports non-significance
 - Results are consistent with the R CausalImpact package
+- Retrospective mode extracts treatment components directly from beta posteriors

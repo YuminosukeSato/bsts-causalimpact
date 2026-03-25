@@ -268,12 +268,28 @@ class TestSamplerErrors:
     """Error case tests."""
 
     def test_sampler_pre_end_equals_T(self):
+        """pre_end == len(y) is valid for retrospective mode (no post-period)."""
         y = [1.0, 2.0, 3.0]
-        with pytest.raises(ValueError, match="post-period"):
+        result = run_gibbs_sampler(
+            y=y,
+            x=None,
+            pre_end=3,
+            niter=10,
+            nwarmup=5,
+            nchains=1,
+            seed=42,
+            prior_level_sd=0.01,
+        )
+        for pred in result.predictions:
+            assert len(pred) == 0
+
+    def test_sampler_pre_end_exceeds_T(self):
+        y = [1.0, 2.0, 3.0]
+        with pytest.raises(ValueError, match="pre_end must be <= length of y"):
             run_gibbs_sampler(
                 y=y,
                 x=None,
-                pre_end=3,
+                pre_end=4,
                 niter=10,
                 nwarmup=5,
                 nchains=1,
