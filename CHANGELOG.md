@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Added
+
+- Horseshoe prior as alternative to spike-and-slab via `ModelOptions(prior_type='horseshoe')`
+  (Kohns & Bhattacharjee 2022, arXiv:2011.00938). Recommended for dense DGP settings
+  where many covariates have true effects.
+- `posterior_shrinkage` property: mean shrinkage factor kappa_j per covariate (horseshoe only).
+- `kappa_shrinkage` field in Rust sampler output for per-iteration shrinkage diagnostics.
+
+### Fixed
+
+- `sample_inv_gamma` no longer panics on non-finite parameters (e.g. extreme-scale
+  inputs with `standardize_data=False`). Returns a small positive fallback instead.
+- `_normalize_model_args` now rejects unknown dict keys (e.g. typo `prior_typee`
+  silently falling back to `spike_slab` is no longer possible).
+- `kappa()` diagnostic now uses the same floor as the precision diagonal for consistency.
+
 ## [1.6.0] - 2026-03-25
 
 ### Added

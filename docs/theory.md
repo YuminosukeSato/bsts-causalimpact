@@ -10,6 +10,7 @@ Five additional capabilities extend the analysis beyond what R offers.
 | Placebo test | `ci.run_placebo_test()` | Validate effects against null distribution |
 | Conformal inference | `ci.run_conformal_analysis()` | Distribution-free prediction intervals |
 | DTW control selection | `select_controls()` | Automatic covariate selection |
+| Horseshoe prior | `ModelOptions(prior_type='horseshoe')` | Continuous shrinkage for dense DGP |
 
 ---
 
@@ -242,6 +243,99 @@ ci = CausalImpact(analysis_data, pre_period, post_period)
 
 Reference: Sakoe & Chiba (1978), "Dynamic programming algorithm optimization
 for spoken word recognition."
+
+---
+
+## Horseshoe Prior
+
+### What it does
+
+The horseshoe prior (Carvalho, Polson & Scott 2010) is a continuous shrinkage
+alternative to spike-and-slab variable selection. While spike-and-slab performs
+discrete inclusion/exclusion of covariates (gamma_j in {0,1}), the horseshoe
+applies adaptive shrinkage that can handle dense DGP settings where many
+covariates have true effects.
+
+Reference: Kohns & Bhattacharjee (2022), "Horseshoe Prior for Sparse Bayesian
+Structural Time Series" (arXiv:2011.00938).
+
+### Hierarchical model
+
+The horseshoe hierarchy uses Half-Cauchy priors decomposed into InvGamma
+auxiliary variables (Makalic & Schmidt 2015):
+
+```
+beta_j | lambda_j, tau, sigma2  ~ N(0, lambda_j^2 * tau^2 * sigma2_obs)
+lambda_j^2 | nu_j               ~ InvGamma(1/2, 1/nu_j)
+nu_j                             ~ InvGamma(1/2, 1)
+tau^2 | xi                       ~ InvGamma(1/2, 1/xi)
+xi                               ~ InvGamma(1/2, 1)
+```
+
+The conditional posteriors used in the Gibbs sampler:
+
+```
+lambda_j^2 | .  ~ InvGamma(1,       1/nu_j + beta_j^2 / (2 * tau^2 * sigma2))
+nu_j       | .  ~ InvGamma(1,       1 + 1/lambda_j^2)
+tau^2      | .  ~ InvGamma((k+1)/2, 1/xi + sum(beta_j^2 / (2 * lambda_j^2 * sigma2)))
+xi         | .  ~ InvGamma(1,       1 + 1/tau^2)
+```
+
+### Beta joint update
+
+Unlike spike-and-slab (coordinate-wise), horseshoe uses a joint beta update:
+
+```
+A = X'X + diag(1 / (lambda_j^2 * tau^2))    (precision matrix)
+b = X'(y - state - seasonal)                 (right-hand side)
+beta ~ N(A^{-1} b, sigma2_obs * A^{-1})     (sampled via Cholesky)
+```
+
+### Shrinkage factor
+
+The shrinkage factor kappa_j measures how much each covariate is shrunk:
+
+```
+kappa_j = 1 / (1 + lambda_j^2 * tau^2)
+```
+
+- kappa_j close to 1: strong shrinkage (covariate effectively excluded)
+- kappa_j close to 0: weak shrinkage (covariate effectively included)
+
+The `posterior_shrinkage` property returns E[kappa_j] averaged over post-warmup
+MCMC iterations.
+
+### When to use
+
+| Scenario | Recommended prior |
+|---|---|
+| Few true covariates among many candidates (sparse DGP) | `spike_slab` (default) |
+| Many covariates with true effects (dense DGP) | `horseshoe` |
+| Time-varying coefficients | `spike_slab` (horseshoe + dynamic_regression not supported) |
+
+### Usage
+
+```python
+from causal_impact import CausalImpact, ModelOptions
+
+ci = CausalImpact(
+    data, pre_period, post_period,
+    model_args=ModelOptions(prior_type='horseshoe', niter=2000, seed=42),
+)
+
+# Shrinkage diagnostics
+print(ci.posterior_shrinkage)   # E[kappa_j] per covariate
+# posterior_inclusion_probs is None for horseshoe
+```
+
+### References
+
+- Carvalho, C.M., Polson, N.G. & Scott, J.G. (2010). The horseshoe estimator
+  for sparse signals. Biometrika, 97(2), 465-480.
+- Kohns, D. & Bhattacharjee, A. (2022). Horseshoe Prior for Sparse Bayesian
+  Structural Time Series. arXiv:2011.00938.
+- Makalic, E. & Schmidt, D.F. (2015). A simple sampler for the horseshoe
+  estimator. IEEE Signal Processing Letters, 23(1), 179-182.
 
 ---
 

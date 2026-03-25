@@ -35,7 +35,8 @@ ci = CausalImpact(data, pre_period, post_period, model_args=None, alpha=0.05)
 |---|---|---|
 | `inferences` | `DataFrame` | Per-timestep actuals, predictions, prediction s.d., and effect intervals |
 | `summary_stats` | `dict` | Aggregate statistics (effect mean, CI, p-value, etc.) |
-| `posterior_inclusion_probs` | `ndarray \| None` | Posterior inclusion probability per covariate (requires covariates) |
+| `posterior_inclusion_probs` | `ndarray \| None` | Posterior inclusion probability per covariate (spike-and-slab only; returns `None` for horseshoe) |
+| `posterior_shrinkage` | `ndarray \| None` | Mean shrinkage factor kappa_j per covariate (horseshoe only; returns `None` for spike-and-slab). Values near 0 = weakly shrunk (included), near 1 = strongly shrunk. |
 
 ## `ModelOptions`
 
@@ -58,6 +59,7 @@ ci = CausalImpact(data, pre_period, post_period, model_args=opts)
 | `standardize_data` | `bool` | `True` | Standardize data before fitting |
 | `expected_model_size` | `int` | 2 | Expected number of active covariates for spike-and-slab prior |
 | `dynamic_regression` | `bool` | `False` | Enable time-varying regression coefficients |
+| `prior_type` | `str` | `"spike_slab"` | `"spike_slab"` (discrete variable selection) or `"horseshoe"` (continuous shrinkage). Horseshoe is recommended for dense DGP settings. |
 | `state_model` | `str` | `"local_level"` | `"local_level"` or `"local_linear_trend"` |
 | `mode` | `str` | `"forward"` | `"forward"` (counterfactual prediction) or `"retrospective"` (treatment indicators as covariates). Retrospective mode adds spot/persistent/trend columns to X and fits on the entire series. Effects are extracted from beta posteriors. |
 | `nseasons` | `int \| None` | `None` | Seasonal cycle count. `nseasons=1` is equivalent to no seasonal component. |
@@ -85,6 +87,54 @@ Returned by `ci._results`. A frozen dataclass containing all computed quantities
 | `predictions_sd` | `ndarray` | Posterior standard deviation of the counterfactual prediction |
 | `predictions_lower` | `ndarray` | Lower CI on counterfactual |
 | `predictions_upper` | `ndarray` | Upper CI on counterfactual |
+
+## Horseshoe Prior (alternative to spike-and-slab)
+
+CausalImpact supports the horseshoe prior (Carvalho, Polson & Scott 2010)
+applied to BSTS regression, following the formulation of
+Kohns & Bhattacharjee (2022) (arXiv:2011.00938).
+
+### When to use horseshoe
+
+| Scenario | Recommended prior |
+|---|---|
+| Few true covariates (sparse DGP) | `spike_slab` (default) |
+| Many true covariates (dense DGP) | `horseshoe` |
+
+### Usage
+
+```python
+from causal_impact import CausalImpact, ModelOptions
+
+ci = CausalImpact(
+    data, pre_period, post_period,
+    model_args=ModelOptions(prior_type='horseshoe'),
+)
+print(ci.posterior_shrinkage)   # mean(kappa_j), 0=included 1=shrunk
+# ci.posterior_inclusion_probs is None for horseshoe (spike-slab only)
+```
+
+### Shrinkage diagnostics
+
+| Property | prior_type | Meaning |
+|---|---|---|
+| `posterior_inclusion_probs` | `spike_slab` | E[gamma_j] — discrete inclusion probability |
+| `posterior_inclusion_probs` | `horseshoe` | `None` (not applicable) |
+| `posterior_shrinkage` | `horseshoe` | E[kappa_j] — continuous shrinkage factor kappa_j = 1/(1+lambda_j^2 * tau^2). Values close to 0 indicate the covariate is weakly shrunk (effectively included). |
+| `posterior_shrinkage` | `spike_slab` | `None` (not applicable) |
+
+### Incompatible combinations
+
+- `prior_type='horseshoe'` + `dynamic_regression=True` raises `ValueError`
+- `prior_type='horseshoe'` + `mode='retrospective'` raises `ValueError`
+
+### References
+
+- Kohns, D. & Bhattacharjee, A. (2022). Horseshoe Prior for Sparse Bayesian Structural Time Series. arXiv:2011.00938.
+- Makalic, E. & Schmidt, D.F. (2015). A simple sampler for the horseshoe estimator. IEEE Signal Processing Letters, 23(1), 179-182.
+- Carvalho, C.M., Polson, N.G. & Scott, J.G. (2010). The horseshoe estimator for sparse signals. Biometrika, 97(2), 465-480.
+
+---
 
 ## Beyond R Extensions
 
