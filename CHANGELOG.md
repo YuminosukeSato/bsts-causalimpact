@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [Unreleased]
+## [1.8.0] - 2026-03-26
 
 ### Removed
 
@@ -13,6 +13,8 @@ The format is based on Keep a Changelog.
   to prevent misinterpretation.
 - Retrospective mode (`mode="retrospective"`): treatment indicator covariate approach.
   Removed along with DATE decomposition.
+
+## [1.7.0] - 2026-03-25
 
 ### Added
 
