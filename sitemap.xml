@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+         <loc>https://yuminosukesato.github.io/bsts-causalimpact/</loc>
+         <lastmod>2026-03-26</lastmod>
+    </url>
+    <url>
+         <loc>https://yuminosukesato.github.io/bsts-causalimpact/api/</loc>
+         <lastmod>2026-03-26</lastmod>
+    </url>
+    <url>
+         <loc>https://yuminosukesato.github.io/bsts-causalimpact/compatibility-matrix/</loc>
+         <lastmod>2026-03-26</lastmod>
+    </url>
+    <url>
+         <loc>https://yuminosukesato.github.io/bsts-causalimpact/examples/</loc>
+         <lastmod>2026-03-26</lastmod>
+    </url>
+    <url>
+         <loc>https://yuminosukesato.github.io/bsts-causalimpact/migration-from-r/</loc>
+         <lastmod>2026-03-26</lastmod>
+    </url>
+    <url>
+         <loc>https://yuminosukesato.github.io/bsts-causalimpact/migration-from-tfp/</loc>
+         <lastmod>2026-03-26</lastmod>
+    </url>
+    <url>
+         <loc>https://yuminosukesato.github.io/bsts-causalimpact/theory/</loc>
+         <lastmod>2026-03-26</lastmod>
+    </url>
+</urlset>
